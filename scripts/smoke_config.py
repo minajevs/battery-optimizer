@@ -211,10 +211,16 @@ def main(argv=None):
              pv_cfg.pv_forecast_cache_minutes, pv_cfg.failure_retry_minutes))
 
     print("")
-    print("Direct control: device_id=%s (%s), inverter_mode_sensor='%s'"
+    # device_id alone no longer decides whether anything is written -
+    # control_mode does, and it is dry_run until explicitly opted out of.
+    print("Direct control: device_id=%s, control_mode=%s (%s)"
           % ("<set>" if cfg.device_id else "<empty>",
-             "live" if cfg.device_id else "DRY-RUN",
-             cfg.inverter_mode_sensor or "(default sensor.growatt_inverter_mode)"))
+             cfg.control_mode,
+             "NO WRITES POSSIBLE" if cfg.control_mode in ("dry_run", "read_only")
+             else "LIVE WRITES"))
+    print("  effect sensors: battery='%s' grid='%s' threshold=%.0fW"
+          % (cfg.battery_power_sensor, cfg.grid_power_sensor,
+             cfg.effect_threshold_w))
 
     # --- 5. keys the current code does not read ---------------------------
     known = known_config_keys()

@@ -33,10 +33,12 @@
 - Include screenshots only if UI entities or dashboards are changed.
 
 ## Architecture & Ops Notes
-- Core dependencies: AppDaemon 4, Home Assistant, Nord Pool integration, Growatt Modbus integration.
+- Core dependencies: AppDaemon 4, Home Assistant, Nord Pool integration, upstream 0xAHA/Growatt_ModbusTCP (no fork required).
+- `../Growatt_ModbusTCP` is a read-only reference checkout — never modify it.
 - Runtime cadence: full optimization at 13:15 daily, adaptive refresh every 30 minutes, safety checks every 5 minutes, and hourly mode application.
 - Dynamic config is read from HA `input_number.*` entities; key outputs surface on `sensor.battery_optimizer`.
-- Inverter control goes through the `growatt_modbus/set_wit_mode` HA service (`battery_optimizer_lib/direct_control.py`); no raw register writes.
+- Inverter control goes through a `ControlBackend` (`battery_optimizer_lib/control/`) that writes the WIT's VPP registers via the upstream integration's generic services. `direct_control.py` is policy only and must stay free of register and service names.
+- `control_mode` (apps.yaml) gates everything: `dry_run` and `read_only` cannot write, and an unrecognised value falls back to `dry_run`.
 
 ## Configuration & Safety Notes
 - This project controls a real Growatt inverter; keep device safety in mind and test in dry-run first.

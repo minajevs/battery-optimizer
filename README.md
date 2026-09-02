@@ -2,7 +2,7 @@
 
 An [AppDaemon](https://appdaemon.readthedocs.io/) application for Home Assistant that uses **Nord Pool** day‑ahead electricity prices (and optionally **Solcast** PV forecasts) to compute and execute an optimal battery **charge / hold / discharge** schedule for a Growatt **WIT** hybrid inverter.
 
-It plans with dynamic programming over SOC, learns your house load and real charge rates over time, tracks the stored‑energy cost, and drives the inverter both in real time (via a `set_wit_mode` service) and autonomously (by writing the inverter's Time‑of‑Use registers so it keeps following the plan even if Home Assistant goes offline).
+It plans with dynamic programming over SOC, learns your house load and real charge rates over time, tracks the stored‑energy cost, and drives the inverter through the Growatt integration's VPP control registers using time‑limited overrides, so the inverter reverts to its own base mode if Home Assistant goes offline.
 
 > ⚠️ This software actively controls battery hardware (grid charging, export, discharge). Use at your own risk and verify behaviour on your own system. See [Disclaimer](#disclaimer).
 
@@ -15,7 +15,7 @@ It plans with dynamic programming over SOC, learns your house load and real char
 - **Temperature‑aware charge rates** — predicts slower charging when the battery is cold for more accurate scheduling.
 - **PV‑aware** — uses Solcast forecasts and a live PV sensor to avoid grid‑charging when solar will cover it.
 - **Battery cost tracking** — weighted-average landed cost of stored energy, persisted across restarts and exposed for reporting; the DP optimizes forecast cash flows directly.
-- **Direct WIT control** — applies modes in real time through the Growatt integration's `set_wit_mode` service (grid_charge, discharge_to_load, max_export, hold, …).
+- **Direct WIT control** — applies modes as VPP register sequences (grid_charge, discharge_to_load, max_export, hold, …) behind a swappable control backend.
 - **Dashboard + manual controls** — HA package with enable/override toggles, manual mode select, force scripts, and rich schedule/status sensors.
 
 ---
@@ -26,7 +26,7 @@ It plans with dynamic programming over SOC, learns your house load and real char
 Nord Pool prices ─┐
 Solcast PV       ─┼─► DP optimizer ─► schedule (96 × 15‑min slots)
 learned load     ─┤        │
-battery SOC/cost ─┘        └─► real‑time execution  → growatt_modbus/set_wit_mode
+battery SOC/cost ─┘        └─► real‑time execution  → VPP registers (30100/30404-30411)
 ```
 
 The optimizer re‑plans on a schedule and adapts when reality drifts from the plan (SOC deviation, new prices, load changes).
@@ -37,8 +37,12 @@ The optimizer re‑plans on a schedule and adapts when reality drifts from the p
 
 - **Home Assistant** with the **AppDaemon 4** add‑on.
 - **Nord Pool** prices — the built‑in HA Nord Pool integration (config entry) or the [HACS Nord Pool](https://github.com/custom-components/nordpool) integration.
-- **Growatt Modbus integration with WIT `set_wit_mode` support.** The stock upstream integration does **not** include `set_wit_mode`; this optimizer depends on the WIT‑enabled fork:
-  **[jekmanis/Growatt_ModbusTCP](https://github.com/jekmanis/Growatt_ModbusTCP)** (branch `main`, v0.9.3+). It must expose the `growatt_modbus/set_wit_mode` service.
+- **Growatt Modbus integration** — the upstream
+  **[0xAHA/Growatt_ModbusTCP](https://github.com/0xAHA/Growatt_ModbusTCP)**. The optimizer
+  drives the WIT's VPP control registers through that integration's generic
+  `write_register` / `write_registers` / `get_register_data` services; no fork is required.
+  **Control is currently read-only** (`control_mode: dry_run` or `read_only`) — see
+  *Inverter control* below.
 - *(Optional)* **Solcast PV Forecast** (HACS) for PV‑aware planning.
 - A long‑lived HA access token (used by the app to read Nord Pool prices via the REST API).
 
@@ -106,7 +110,7 @@ homeassistant:
 ```
 
 ### 5. Restart
-Restart Home Assistant, then restart the AppDaemon add‑on. Watch **Settings → Add‑ons → AppDaemon → Log** for `Direct control enabled via growatt_modbus/set_wit_mode` and the first optimization.
+Restart Home Assistant, then restart the AppDaemon add‑on. Watch **Settings → Add‑ons → AppDaemon → Log** for the `BATTERY OPTIMIZER CONTROL:` banner (it states whether writes are possible at all) and the first optimization.
 
 ---
 
@@ -150,7 +154,14 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `pv_threshold_w` | 500 | PV above which grid charging pauses |
 | `solcast_today_entity` / `_tomorrow_entity` | `sensor.solcast_*` | Optional PV forecast |
 | `device_id` | `""` | **Empty = dry‑run** (logs decisions, no inverter writes) |
-| `set_wit_mode_timeout_seconds` | 15 | Per‑call `hass_timeout`. This call **blocks the AppDaemon callback thread** — see *AppDaemon threads* |
+| `control_mode` | `dry_run` | `dry_run` = plan and log only; `read_only` = real reads, writes still impossible. **This, not `device_id`, decides whether anything is written** |
+| `command_timeout_seconds` | 15 | Per‑call `hass_timeout` (old name `set_wit_mode_timeout_seconds` still accepted). **Blocks the AppDaemon callback thread** — see *AppDaemon threads* |
+| `wit_cooldown_seconds` | 30 | The integration's per‑register write cooldown. A collision **defers** a command; it is retried, not dropped |
+| `release_settle_seconds` | 35 | Gap between revoking authority (30100=0) and disarming (30407=0). Scheduled, never slept on |
+| `priority_mode_write` | `auto` | Use register 30476 only once a supervised probe confirms it is genuinely writable; `never` leaves it alone |
+| `battery_power_sensor` | `sensor.growatt_battery_battery_power` | Signed W, **positive = charging**. Required for EFFECT verification |
+| `grid_power_sensor` | `sensor.growatt_grid_grid_power` | Signed W, **positive = exporting** — the opposite convention |
+| `effect_threshold_w` | 200 | Minimum \|W\| that counts as the inverter genuinely acting |
 | `verify_delay_seconds` | 90 | Delay before the first verify‑after‑set read of the Inverter Mode sensor |
 | `verify_recheck_seconds` | 60 | Delay of the single re‑check performed after a resend |
 | `callback_warn_seconds` | 10 | Warn when one of this app's callbacks blocks for longer than this |
@@ -225,7 +236,8 @@ appdaemon/apps/
     ├── load_profile.py           # Statistical load forecasting
     ├── pv_forecast_service.py    # Solcast PV forecast integration
     ├── price_service.py          # Nord Pool price fetching
-    ├── direct_control.py         # Real‑time control via set_wit_mode
+    ├── direct_control.py         # Control policy (outcomes, dedup, verify ladder)
+    ├── control/                  # actions.py, backend.py, upstream_vpp.py
     ├── cost_tracker.py           # Stored‑energy cost tracking
     ├── schedule_formatter.py     # Schedule → sensor/dashboard formatting
     ├── soc_deviation.py          # Detects unexpected SOC changes
@@ -261,8 +273,8 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 - **Logs:** Settings → Add‑ons → AppDaemon → Log.
 - **Dry‑run:** set `device_id: ""` to log decisions without touching the inverter.
 - **Entities `unavailable` / `not found`:** confirm the Growatt sensor names match your install (integration v0.6.7+ device‑prefixes them, e.g. `sensor.growatt_battery_battery_soc`).
-- **`set_wit_mode` not found:** you're on the stock Growatt integration — install the [WIT fork](https://github.com/jekmanis/Growatt_ModbusTCP).
-- **`set_wit_mode` timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer sets that per-call window from `set_wit_mode_timeout_seconds` (**default 15 s**) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied — verify-after-set covers that case, which is why a short timeout is safe and a long one is not (it blocks every other callback). A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
+- **Nothing happens on the inverter:** check `control_mode` in `apps.yaml`. It is `dry_run` by default and **cannot** write; the startup log states the mode in a banner and `sensor.battery_inverter_control_health` reports it as `control_status`.
+- **Command timeouts:** many sequential VPP register writes on a busy Modbus link can exceed AppDaemon's default 10 s service window. The optimizer sets that per-call window from `command_timeout_seconds` (**default 15 s**) and inspects the service response. If AppDaemon still times out client-side (returns `None`), the mode is treated as *unconfirmed* (logged at WARNING) rather than silently assumed applied — verify-after-set covers that case, which is why a short timeout is safe and a long one is not (it blocks every other callback). A confirmed failure (the service raised) is logged at ERROR and is **not** recorded as sent, so it is retried on the next slot instead of being masked by duplicate suppression.
 
 - **Mode mismatches / "resending once":** `verify_delay_seconds` (default 90 s) after every mode change — including `passthrough` — DirectControl reads the integration's **Inverter Mode** sensor (`sensor.growatt_inverter_mode` by default, overridable via `inverter_mode_sensor`). On a genuine mismatch it resends once and then re-checks **exactly once** after `verify_recheck_seconds` (default 60 s). If that second read still disagrees, the app logs an **ERROR** ("persistent mode mismatch after resend") and stops — never a third send, never a loop; the next slot retries normally.
 
@@ -276,7 +288,7 @@ uv run pytest tests/ --cov=appdaemon/apps --cov-report=term-missing
 
   The sensor is created with `set_state`, so it disappears after an HA restart until the app republishes it — alert on trends, don't rely on its history.
 
-- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** `set_wit_mode` is a **synchronous, blocking** service call on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Give this app more threads:
+- **AppDaemon threads — "Excessive time spent in callback (limit=10.0s)":** inverter service calls are **synchronous and blocking** on the AppDaemon callback thread. With the default single thread, one slow inverter write stalls schedule execution, the SOC listener and PV sampling alike (33 h of production logs: 70 overruns of 10–34 s, all on `thread-0`). Give this app more threads:
 
   ```yaml
   # appdaemon.yaml

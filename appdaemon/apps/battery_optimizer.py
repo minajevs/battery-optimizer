@@ -71,6 +71,7 @@ from battery_optimizer_lib import (
     AmbientTemperatureService,
     AmbientServiceConfig,
 )
+from battery_optimizer_lib.control import UpstreamVppBackend, build_executor
 from battery_optimizer_lib.direct_control import ApplyOutcome
 from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
 from battery_optimizer_lib.pv_profile import PvProfile
@@ -156,6 +157,7 @@ class BatteryOptimizer(hass.Hass):
         # inverter health either way.
         self._apply_duplicate_count: int = 0
         self._apply_dry_run_count: int = 0
+        self._apply_rate_limited_count: int = 0
         self._callback_overrun_count: int = 0
         self._slowest_callback: Optional[Tuple[str, float]] = None
         self._threads_hint_logged: bool = False
@@ -258,8 +260,20 @@ class BatteryOptimizer(hass.Hass):
             log_func=self.log,
         )
 
-        # Direct inverter control via set_wit_mode service
-        self._direct_control = DirectControl(self, self.config)
+        # Direct inverter control. The backend is constructed explicitly so the
+        # integration-specific half is visible at the wiring site and can be
+        # swapped without touching policy. UpstreamVppBackend defaults to
+        # dry-run: it builds and logs register sequences but executes nothing
+        # until a live executor is supplied.
+        self._control_backend = UpstreamVppBackend(
+            self, self.config, executor=build_executor(self, self.config)
+        )
+        self._direct_control = DirectControl(self, self.config, self._control_backend)
+        self._log_control_mode_banner()
+        # Seed the backend from what the inverter actually reports, so we do
+        # not rewrite registers that already hold the right value and so an
+        # inherited VPP state is noticed rather than silently built upon.
+        self._control_backend.reconcile()
 
         # Nord Pool price service for fetching electricity prices
         self._price_service = NordPoolPriceService(
@@ -1531,6 +1545,27 @@ class BatteryOptimizer(hass.Hass):
         # Send command to inverter
         self._apply_mode_tracked(entry)
 
+    def _log_control_mode_banner(self) -> None:
+        """Say loudly, at startup, whether this app can actually drive anything.
+
+        A dependency-injection mistake that leaves the backend on the dry-run
+        executor is electrically safe but operationally awful: every log line
+        and counter would look healthy while the inverter was following its own
+        base mode. So the mode is stated unmistakably, in a banner, and is also
+        published on sensor.battery_inverter_control_health as control_status.
+        """
+        backend = getattr(self, "_control_backend", None)
+        if backend is None:
+            return
+
+        message = backend.describe_mode()
+        if backend.dry_run:
+            self.log("=" * 72, level="WARNING")
+            self.log(message, level="WARNING")
+            self.log("=" * 72, level="WARNING")
+        else:
+            self.log(message)
+
     def _apply_mode_tracked(self, entry: ScheduleEntry) -> bool:
         """Send one mode command and account for its outcome.
 
@@ -1600,6 +1635,13 @@ class BatteryOptimizer(hass.Hass):
                     f"sensor.battery_inverter_control_health.",
                     level="ERROR",
                 )
+        elif outcome is ApplyOutcome.RATE_LIMITED:
+            # The command was NOT applied — a per-register write cooldown
+            # refused it. That is neither success nor evidence of ill health,
+            # so no streak is touched; DirectControl has scheduled a retry.
+            # It must not be counted as applied: a deferred safety HOLD that
+            # looked successful would be a silently dropped safety command.
+            self._apply_rate_limited_count += 1
         elif outcome is ApplyOutcome.SKIPPED_DUPLICATE:
             # Nothing was transmitted — neither evidence of health nor of
             # failure, so no streak may be reset here.
@@ -1613,7 +1655,7 @@ class BatteryOptimizer(hass.Hass):
             self._consecutive_apply_unconfirmed = 0
 
         self._update_control_health_sensor()
-        return outcome is not ApplyOutcome.FAILED
+        return outcome.applied
 
     def _update_control_health_sensor(self) -> None:
         """Publish inverter-control diagnostics as its own HA sensor.
@@ -1642,6 +1684,7 @@ class BatteryOptimizer(hass.Hass):
                         self._consecutive_apply_unconfirmed,
                     "apply_duplicates_skipped": self._apply_duplicate_count,
                     "apply_dry_runs": self._apply_dry_run_count,
+                    "apply_rate_limited": self._apply_rate_limited_count,
                     "callback_overruns": self._callback_overrun_count,
                     "slowest_callback": (
                         f"{self._slowest_callback[0]} "

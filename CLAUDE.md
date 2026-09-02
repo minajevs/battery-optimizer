@@ -148,12 +148,52 @@ At the price-horizon boundary, `terminal_energy_value_eur_kwh` values usable sto
 
 **The schedule log's value column is `ScheduleEntry.marginal_value_eur_kwh`, not the cost basis.** The DP fills it (with `value_basis` ∈ `avoided-import` / `export` / `landed-charge` / `kept`) from the same `_buy_price`/`_sell_price` arithmetic it scores slots with, normalized to one battery DC kWh. It is REPORTING ONLY — the DP objective never reads it, and `tests/test_schedule_value_column.py::test_marginal_value_does_not_change_the_schedule` guards that. Any new tariff formula must go through `_buy_price`/`_sell_price` so the report cannot drift from the objective.
 
-### Inverter Control (DirectControl)
-The schedule is executed by sending mode commands to the Growatt WIT inverter
-via the `growatt_modbus/set_wit_mode` HA service (no raw register writes):
-- Modes: `grid_charge`, `discharge_to_load`, `discharge_to_grid`, `max_export`, `hold`, `passthrough`
+### Inverter Control (DirectControl + ControlBackend)
+`DirectControl` is **policy only** — it knows no register or service name. All
+integration-specific knowledge lives behind a `ControlBackend`
+(`battery_optimizer_lib/control/`), because upstream 0xAHA/Growatt_ModbusTCP has
+no `set_wit_mode`: one fork service call becomes a sequence of VPP register
+writes.
+
+**Layering:** `DirectControl` -> `ControlBackend` -> `CommandPlan` -> `Executor`.
+The executor seam is what makes writes *structurally* impossible rather than
+merely disabled: `DryRunExecutor` performs no I/O, `HaReadOnlyExecutor` performs
+real `get_register_data` reads and **refuses** every write step. `control_mode`
+in apps.yaml picks one, and an unrecognised value falls back to `dry_run` — a
+typo must never be what grants write access to an inverter.
+
+**Three hardware facts the sequences rest on** (upstream `docs/controls/wit-guide.md`):
+1. Only 30100/30407 = 0/0 and 1/1 are safe. **1/0 is the VPP standby hazard** —
+   local battery logic suspended, load drawn from the grid.
+2. Write order is 30408 -> 30409 -> **30407 last**. Arming first applies a stale
+   setpoint.
+3. Only 30407/30408/30409 are "Not storage" (EEPROM-safe). Everything else is
+   written **only on change**.
+
+`30409 = 0` is *not* idle — it is "suspend forced cycle". **HOLD is +1%.**
+`30474` is a mirror of the last *commanded* setpoint, NOT applied power, so it
+can never prove the inverter is doing anything.
+
+- Actions: `grid_charge`, `discharge_to_load`, `discharge_to_grid`, `max_export`, `hold`, `passthrough`
+- Authority is acquired LATE and armed immediately; if arming fails afterwards
+  the backend enters `ARM_FAILED_AUTHORITY_HELD` and schedules a rollback —
+  it cannot revoke immediately, because its own successful `30100=1` stamped the
+  30 s cooldown that now blocks `30100=0`.
+- Release is a **lifecycle**, not a call: `ACTIVE -> RELEASE_PENDING -> 30100=0
+  -> read-back confirms -> settle -> 30407=0 -> RELEASED`. `RELEASED` means a
+  read-back said `30100 == 0`; override *timer expiry* is a different thing and
+  must not be conflated with it. `safe_to_stop` on the health sensor says when
+  it is safe to stop/reload AppDaemon.
 - Each command carries power_percent, duration, export_rate, ac_charge_mode, and SOC cutoffs
-- AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV power
+- AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV
+  power. This is INTENT only: register 30410 accepts 0 and 1 on the reference
+  firmware and rejects 2 with Illegal Function, so 2 is never written.
+- Verification is three levels: **ACK** (registers read back as commanded),
+  **COMMAND MIRROR** (30474 — diagnostic only, never proof), and **EFFECT**
+  (measured power). EFFECT is tri-state: a grid-charge satisfied by PV surplus
+  is `INDETERMINATE`, not success and not failure, and only an unambiguous
+  `FAIL` may latch a fallback. `battery_power > 0` is charging while
+  `grid_power > 0` is EXPORTING — **opposite conventions**.
 - Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
 - Reliability: each call passes `hass_timeout=config.set_wit_mode_timeout_seconds` (default **15**) and inspects the service response. A raised/`success=False` result is a confirmed failure (ERROR, returns False, last-sent NOT recorded so it retries next slot). A `None` result is an unconfirmed client-side timeout (WARNING, last-sent recorded to avoid schedule spam). The timeout is short *because* the None path is safe: verify-after-set catches a genuinely lost command, whereas a long timeout blocks every other callback of this app.
 - Health accounting reads `apply_mode_with_outcome`'s `ApplyOutcome`, never the boolean: `apply_mode` returns True for three outcomes the inverter never acknowledged (`DRY_RUN`, `SKIPPED_DUPLICATE`, `UNCONFIRMED_TIMEOUT`), so only `SENT` resets `_consecutive_apply_failures`, an unconfirmed timeout escalates to the same ERROR after 3 in a row (the hung-modbus case), and a duplicate skip or dry run is neutral.

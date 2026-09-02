@@ -54,6 +54,15 @@ class BatteryOptimizerConfig:
     battery_temp_sensor: str = ""
     battery_charge_sensor: str = "sensor.growatt_battery_charge_today"
     battery_discharge_sensor: str = "sensor.growatt_battery_discharge_today"
+    # Signed INSTANTANEOUS power, for EFFECT verification. The *_today sensors
+    # above are kWh energy counters and cannot resolve a 60-90 s window.
+    # NOTE the two sign conventions are OPPOSITE:
+    #   battery_power_sensor: positive = CHARGING
+    #   grid_power_sensor:    positive = EXPORTING
+    battery_power_sensor: str = "sensor.growatt_battery_battery_power"
+    grid_power_sensor: str = "sensor.growatt_grid_grid_power"
+    # Minimum |W| that counts as the inverter genuinely acting on a command.
+    effect_threshold_w: float = 200.0
     use_inverter_energy_sensors: bool = True
     load_power_sensor: str = ""
 
@@ -83,7 +92,21 @@ class BatteryOptimizerConfig:
     # Per-call websocket timeout for set_wit_mode. This call is SYNCHRONOUS on
     # the AppDaemon callback thread: every second here blocks every other
     # callback of this app. Keep it just above the handler's normal duration.
-    set_wit_mode_timeout_seconds: int = 15
+    command_timeout_seconds: int = 15
+    # Per-register write cooldown enforced by the integration (30 s on the VPP
+    # control registers). A collision defers a command; it does not fail it.
+    wit_cooldown_seconds: int = 30
+    # Seconds between revoking control authority and disarming remote control
+    # on release. SCHEDULED, never slept on.
+    release_settle_seconds: int = 35
+    # "auto" = use register 30476 only if a supervised probe confirmed it is
+    # genuinely writable; "never" = never write it.
+    priority_mode_write: str = "auto"
+    # How the control backend is allowed to talk to the inverter:
+    #   "dry_run"   - plan and log only, no I/O whatsoever (default)
+    #   "read_only" - real register/entity READS, writes still impossible
+    # Live writes are a later, explicitly opted-in slice.
+    control_mode: str = "dry_run"
 
     # =========================================================================
     # Battery Parameters
@@ -132,13 +155,11 @@ class BatteryOptimizerConfig:
     pv_reactive_consecutive_slots: int = 2  # Consecutive shortfall slots before a full recalc
     pv_reactive_min_samples: int = 3  # Min samples in a slot before its mean is trusted
     pv_sample_seconds: int = 60  # PV power sampling interval (s)
-    inverter_mode_sensor: str = ""  # Integration "Inverter Mode" sensor. Used for
-    # monitoring AND set_wit_mode verify-after-set. The entity id depends on the
-    # config entry name (slugified "<entry> Inverter Mode"): e.g.
-    # sensor.growatt_inverter_mode (entry "Growatt") or
-    # sensor.growatt_wit_inverter_mode (entry "Growatt WIT"). When empty,
-    # DirectControl falls back to sensor.growatt_inverter_mode; set this
-    # explicitly if your entry is named differently.
+    inverter_mode_sensor: str = ""  # OPTIONAL monitoring only.
+    # The upstream integration has no "Inverter Mode" status sensor — that was a
+    # fork-only entity — so verification NO LONGER reads it: DirectControl now
+    # verifies against register read-back through the control backend. This key
+    # survives solely for _get_inverter_mode() reporting, and is inert when empty.
 
     # =========================================================================
     # PV Forecast Service (Solcast / Forecast.Solar)
@@ -335,8 +356,10 @@ class BatteryOptimizerConfig:
         # Inverter control timing / blocking
         self.verify_delay_seconds = max(5, min(600, int(self.verify_delay_seconds)))
         self.verify_recheck_seconds = max(5, min(600, int(self.verify_recheck_seconds)))
-        self.set_wit_mode_timeout_seconds = max(
-            5, min(120, int(self.set_wit_mode_timeout_seconds))
+        if self.control_mode not in ("dry_run", "read_only"):
+            self.control_mode = "dry_run"
+        self.command_timeout_seconds = max(
+            5, min(120, int(self.command_timeout_seconds))
         )
         self.callback_warn_seconds = max(1.0, min(60.0, float(self.callback_warn_seconds)))
 
@@ -415,6 +438,13 @@ class BatteryOptimizerConfig:
             battery_temp_sensor=args.get("battery_temp_sensor", ""),
             battery_charge_sensor=args.get("battery_charge_sensor", "sensor.growatt_battery_charge_today"),
             battery_discharge_sensor=args.get("battery_discharge_sensor", "sensor.growatt_battery_discharge_today"),
+            battery_power_sensor=args.get("battery_power_sensor", "sensor.growatt_battery_battery_power"),
+            grid_power_sensor=args.get("grid_power_sensor", "sensor.growatt_grid_grid_power"),
+            effect_threshold_w=float(args.get("effect_threshold_w", 200.0)),
+            wit_cooldown_seconds=int(args.get("wit_cooldown_seconds", 30)),
+            release_settle_seconds=int(args.get("release_settle_seconds", 35)),
+            priority_mode_write=args.get("priority_mode_write", "auto"),
+            control_mode=args.get("control_mode", "dry_run"),
             use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),
             load_power_sensor=args.get("load_power_sensor", ""),
 
@@ -426,8 +456,9 @@ class BatteryOptimizerConfig:
             default_power_percent=int(args.get("default_power_percent", 100)),
             verify_delay_seconds=int(args.get("verify_delay_seconds", 90)),
             verify_recheck_seconds=int(args.get("verify_recheck_seconds", 60)),
-            set_wit_mode_timeout_seconds=int(
-                args.get("set_wit_mode_timeout_seconds", 15)
+            command_timeout_seconds=int(
+                args.get("command_timeout_seconds",
+                         args.get("set_wit_mode_timeout_seconds", 15))
             ),
 
             # Battery Parameters
@@ -585,10 +616,10 @@ class BatteryOptimizerConfig:
             f"ha_token={'SET' if self.ha_token else 'NOT SET'}"
         )
         if self.device_id:
-            log_func(f"Direct control enabled via growatt_modbus/set_wit_mode (device: {self.device_id})")
+            log_func(f"Direct control enabled via upstream growatt_modbus VPP registers (device: {self.device_id})")
         log_func(
-            f"Inverter control timing: set_wit_mode timeout="
-            f"{self.set_wit_mode_timeout_seconds}s (blocks the callback thread), "
+            f"Inverter control timing: command timeout="
+            f"{self.command_timeout_seconds}s (blocks the callback thread), "
             f"verify after {self.verify_delay_seconds}s, "
             f"re-check {self.verify_recheck_seconds}s after a resend; "
             f"slow-callback warning at {self.callback_warn_seconds:.0f}s"

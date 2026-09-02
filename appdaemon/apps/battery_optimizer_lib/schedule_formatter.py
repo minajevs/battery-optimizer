@@ -14,6 +14,7 @@ import datetime
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .control.actions import resolve_action
 from .models import (
     BatteryMode,
     PricePoint,
@@ -35,25 +36,13 @@ _WIT_MODE_DISPLAY = {
 
 
 def resolve_wit_mode(entry: ScheduleEntry, default_power_percent: int = 100) -> str:
-    """Map a ScheduleEntry to the WIT mode string that DirectControl would send.
+    """Map a ScheduleEntry to the mode string the backend will act on.
 
-    Mirrors DirectControl._resolve_charge_mode / _resolve_discharge_mode logic
-    so the display layer can show the same mode without importing DirectControl.
+    Delegates to :func:`control.actions.resolve_action` — the display layer and
+    the control layer MUST agree on which slots export to the grid, and they
+    used to agree only by a hand-maintained copy of the rule.
     """
-    mode = entry.mode
-    if mode == BatteryMode.CHARGE:
-        return "grid_charge"
-    elif mode == BatteryMode.DISCHARGE:
-        export_rate = entry.export_rate
-        if export_rate is not None and export_rate > 0:
-            # DirectControl always sends config.default_power_percent; ScheduleEntry
-            # no longer carries a per-slot power_percent.
-            if export_rate >= 100 and default_power_percent >= 100:
-                return "max_export"
-            return "discharge_to_grid"
-        return "discharge_to_load"
-    else:
-        return "hold"
+    return resolve_action(entry, default_power_percent).value
 
 
 @dataclass

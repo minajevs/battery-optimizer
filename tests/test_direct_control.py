@@ -1,58 +1,93 @@
-"""Tests for DirectControl set_wit_mode reliability behavior.
+"""Tests for DirectControl policy: outcomes, deduplication, verify ladder.
+
+DirectControl no longer knows about services or registers — it drives a
+ControlBackend. These tests therefore exercise policy against a FakeBackend;
+the register-level contract lives in test_upstream_vpp_backend.py.
 
 Covers:
-- timeout (call_service returns None) -> unconfirmed, still records last-sent,
-  schedules verification, logs WARNING
-- confirmed failure (exception or success=False) -> returns False, does NOT
-  record last-sent, schedules no verification
+- unconfirmed send -> records last-sent, schedules verification, logs WARNING
+- confirmed failure -> returns False, does NOT record last-sent, no verification
+- rate-limited send -> NOT applied, no failure escalation, retry scheduled
 - verify-after-set mismatch -> resends once (bypassing duplicate suppression),
   then re-checks exactly once; a persistent mismatch escalates to ERROR without
   ever sending a third time (bounded ladder, no resend loop)
 - verify/timeout delays are configurable and counters are exposed
-- verify-after-set match -> no resend
-- verify-after-set unavailable sensor -> cannot verify, no resend
 - pending verification timer is superseded when a new mode is applied
 """
+
+from __future__ import annotations
 
 import datetime
 
 import pytest
 
 from battery_optimizer_lib.config import BatteryOptimizerConfig
-from battery_optimizer_lib.direct_control import (
-    ApplyOutcome,
-    DirectControl,
-    DEFAULT_MODE_STATUS_ENTITY,
+from battery_optimizer_lib.control import (
+    ControlAction,
+    EffectVerdict,
+    InverterState,
+    SendResult,
+    VerifyResult,
+    VerifyVerdict,
 )
+from battery_optimizer_lib.direct_control import ApplyOutcome, DirectControl
 from battery_optimizer_lib.models import BatteryMode, ScheduleEntry
+
+
+class FakeBackend:
+    """Backend double: records commands, returns scripted results."""
+
+    name = "fake"
+
+    def __init__(self):
+        self.send_result = SendResult.CONFIRMED
+        self.send_raise = None          # set to an Exception instance to raise
+        self.release_result = SendResult.CONFIRMED
+        self.release_raise = None
+        self.sent = []                  # list of InverterCommand
+        self.released = 0
+
+        # Verification scripting
+        self.verdict = VerifyVerdict.UNVERIFIABLE
+        self.effect = EffectVerdict.PASS
+        self.actual = "unreadable"
+        self.state = None               # InverterState or None
+
+    def send(self, command):
+        self.sent.append(command)
+        if self.send_raise is not None:
+            raise self.send_raise
+        return self.send_result
+
+    def release(self):
+        self.released += 1
+        if self.release_raise is not None:
+            raise self.release_raise
+        return self.release_result
+
+    def read_state(self):
+        return self.state
+
+    def verify(self, command, state):
+        return VerifyResult(
+            verdict=self.verdict, actual=self.actual, effect=self.effect
+        )
+
+    def get_diagnostics(self):
+        return {"backend": self.name}
 
 
 class FakeApp:
     """Minimal AppDaemon app double exposing the methods DirectControl uses."""
 
     def __init__(self):
-        # call_service behavior
-        self.call_service_return = {"success": True}
-        self.call_service_raise = None  # set to an Exception instance to raise
-        self.service_calls = []  # list of (service, kwargs)
-
-        # get_state backing store: {entity_id: state}
         self.states = {}
 
-        # scheduler
         self._next_handle = 0
         self.run_in_calls = []  # list of (callback, delay, kwargs, handle)
-        self.cancelled = []  # list of cancelled handles
+        self.cancelled = []
 
-        # logging
         self.logs = []  # list of (message, level)
-
-    # --- AppDaemon API surface used by DirectControl ---
-    def call_service(self, service, **kwargs):
-        self.service_calls.append((service, kwargs))
-        if self.call_service_raise is not None:
-            raise self.call_service_raise
-        return self.call_service_return
 
     def get_state(self, entity):
         return self.states.get(entity)
@@ -82,7 +117,8 @@ class FakeApp:
 def make_dc(device_id="dev123", **overrides):
     config = BatteryOptimizerConfig(device_id=device_id, **overrides)
     app = FakeApp()
-    return DirectControl(app, config), app
+    backend = FakeBackend()
+    return DirectControl(app, config, backend), app, backend
 
 
 def hold_entry():
@@ -101,94 +137,89 @@ def charge_entry():
     )
 
 
+def matching(backend, actual="auth=1 remote=1"):
+    backend.verdict = VerifyVerdict.MATCH
+    backend.actual = actual
+    backend.state = InverterState(control_authority=1, remote_enabled=1)
+
+
+def mismatching(backend, actual="auth=0 remote=0"):
+    backend.verdict = VerifyVerdict.MISMATCH
+    backend.actual = actual
+    backend.state = InverterState(control_authority=0, remote_enabled=0)
+
+
 # ---------------------------------------------------------------------------
-# Task 1: timeout / failure detection
+# Outcome / failure detection
 # ---------------------------------------------------------------------------
 
-def test_timeout_none_is_unconfirmed_but_records_and_schedules():
-    """call_service returning None (client-side timeout) -> unconfirmed."""
-    dc, app = make_dc()
-    app.call_service_return = None
+def test_unconfirmed_send_records_and_schedules():
+    """An unconfirmed send still records last-sent and schedules verification."""
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.UNCONFIRMED
 
     result = dc.apply_mode(hold_entry())
 
     assert result is True
-    # hass_timeout was passed on the service call, at the CONFIGURED value.
-    # It is deliberately not hard-coded any more: the call is synchronous on the
-    # AppDaemon callback thread, so the timeout is a blocking budget.
-    assert app.service_calls[0][1].get("hass_timeout") == dc._set_mode_timeout
-    assert dc._set_mode_timeout == BatteryOptimizerConfig().set_wit_mode_timeout_seconds
-    # last-sent recorded so the schedule isn't spammed
-    assert dc._last_mode_sent == "hold"
+    assert dc._last_action_sent == "hold"
     assert dc._last_mode_time is not None
-    # WARNING about unconfirmed state
     assert "WARNING" in app.levels()
-    # verification scheduled
     assert len(app.run_in_calls) == 1
     assert app.run_in_calls[0][1] == dc._verify_delay
     assert app.run_in_calls[0][2]["attempt"] == 1
 
 
 def test_failure_exception_returns_false_and_does_not_record():
-    """Handler raising -> exception here -> confirmed failure."""
-    dc, app = make_dc()
-    app.call_service_raise = RuntimeError("boom")
+    """A backend that raises is a confirmed failure."""
+    dc, app, backend = make_dc()
+    backend.send_raise = RuntimeError("boom")
 
     result = dc.apply_mode(hold_entry())
 
     assert result is False
-    assert dc._last_mode_sent is None  # not recorded -> resend not suppressed
+    assert dc._last_action_sent is None  # not recorded -> resend not suppressed
     assert dc._last_mode_time is None
-    assert len(app.run_in_calls) == 0  # no verification scheduled
+    assert len(app.run_in_calls) == 0    # no verification scheduled
     assert "ERROR" in app.levels()
 
 
-def test_failure_success_false_returns_false_and_does_not_record():
-    """Explicit success=False in the response dict -> confirmed failure."""
-    dc, app = make_dc()
-    app.call_service_return = {"success": False, "error": "nope"}
+def test_failure_result_returns_false_and_does_not_record():
+    """An explicit FAILED result behaves like a raise."""
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.FAILED
 
     result = dc.apply_mode(hold_entry())
 
     assert result is False
-    assert dc._last_mode_sent is None
+    assert dc._last_action_sent is None
     assert len(app.run_in_calls) == 0
     assert "ERROR" in app.levels()
 
 
-def test_service_call_kwargs_only_hass_timeout_plus_schema_fields():
-    """No return_result/return_response key; only schema-valid service fields.
+def test_command_carries_resolved_action_and_watchdog_duration():
+    """The command handed to the backend is fully resolved policy."""
+    dc, app, backend = make_dc()
 
-    An unknown kwarg would be forwarded to HA's strict voluptuous schema and
-    fail every set_wit_mode call with "extra keys not allowed".
-    """
-    dc, app = make_dc()
-    dc.apply_mode(hold_entry())
+    dc.apply_mode(charge_entry())
 
-    service, kwargs = app.service_calls[0]
-    assert service == "growatt_modbus/set_wit_mode"
-    # The legacy/incorrect kwargs must never be present.
-    assert "return_result" not in kwargs
-    assert "return_response" not in kwargs
-    # hass_timeout is the only non-service-data kwarg (consumed by the plugin).
-    assert kwargs.get("hass_timeout") == dc._set_mode_timeout
-    # Everything else must be a field the set_wit_mode voluptuous schema allows.
-    allowed = {
-        "hass_timeout",  # AppDaemon HASS plugin formal parameter
-        "device_id", "mode", "power_percent", "duration_minutes",
-        "export_rate", "ac_charge_mode", "charge_cutoff_soc",
-        "discharge_cutoff_soc",
-    }
-    assert set(kwargs).issubset(allowed), f"unexpected kwargs: {set(kwargs) - allowed}"
+    command = backend.sent[0]
+    assert command.action is ControlAction.GRID_CHARGE
+    assert command.duration_minutes == (
+        dc.config.slot_minutes + dc.config.direct_control_buffer_minutes
+    )
+    assert command.power_percent == dc.config.default_power_percent
+    # A CHARGE slot carries the charge cutoff, never the discharge one.
+    assert command.charge_cutoff_soc == int(dc.config.default_max_soc)
+    assert command.discharge_cutoff_soc is None
 
 
 def test_first_unverifiable_logs_warning_then_debug():
     """First cannot-verify occurrence is WARNING; subsequent ones are DEBUG."""
-    dc, app = make_dc()
-    # mode sensor absent -> get_state returns None -> cannot verify
+    dc, app, backend = make_dc()
+    # backend.verdict defaults to UNVERIFIABLE
 
     dc.apply_mode(hold_entry())
-    app.fire_last_timer()  # first verification: sensor unreadable
+    app.fire_last_timer()
 
     cannot_verify_warnings = [
         m for m, lvl in app.logs
@@ -196,7 +227,6 @@ def test_first_unverifiable_logs_warning_then_debug():
     ]
     assert len(cannot_verify_warnings) == 1
 
-    # A second send + verify with the sensor still unreadable stays at DEBUG.
     logs_before = len(app.logs)
     dc.apply_mode(charge_entry())  # different mode -> not a duplicate
     app.fire_last_timer()
@@ -211,16 +241,13 @@ def test_first_unverifiable_logs_warning_then_debug():
 
 def test_failed_apply_cancels_pending_verification_timer():
     """A confirmed-failure send cancels a timer from a previous good send."""
-    dc, app = make_dc()
+    dc, app, backend = make_dc()
 
-    # First send succeeds and schedules timer_1.
     dc.apply_mode(hold_entry())
     first_handle = app.run_in_calls[0][3]
     assert len(app.run_in_calls) == 1
 
-    # Second send (different mode) fails -> must cancel the stale timer and
-    # NOT schedule a new one.
-    app.call_service_raise = RuntimeError("boom")
+    backend.send_raise = RuntimeError("boom")
     result = dc.apply_mode(charge_entry())
 
     assert result is False
@@ -230,12 +257,12 @@ def test_failed_apply_cancels_pending_verification_timer():
 
 def test_failed_release_cancels_pending_verification_timer():
     """A failed release_control also cancels a previously pending timer."""
-    dc, app = make_dc()
+    dc, app, backend = make_dc()
 
-    dc.apply_mode(hold_entry())  # schedules timer_1
+    dc.apply_mode(hold_entry())
     first_handle = app.run_in_calls[0][3]
 
-    app.call_service_raise = RuntimeError("boom")
+    backend.release_raise = RuntimeError("boom")
     result = dc.release_control()
 
     assert result is False
@@ -244,54 +271,95 @@ def test_failed_release_cancels_pending_verification_timer():
 
 
 def test_success_records_and_schedules_verification():
-    """Confirmed success records last-sent and schedules verification."""
-    dc, app = make_dc()
-    app.call_service_return = {"success": True, "mode_applied": "hold"}
+    dc, app, backend = make_dc()
 
     result = dc.apply_mode(hold_entry())
 
     assert result is True
-    assert dc._last_mode_sent == "hold"
+    assert dc._last_action_sent == "hold"
     assert len(app.run_in_calls) == 1
 
 
 # ---------------------------------------------------------------------------
-# Task 2: verify-after-set
+# RATE_LIMITED: deferred, not tolerated
+# ---------------------------------------------------------------------------
+
+def test_rate_limited_is_not_applied_and_schedules_a_retry():
+    """A cooldown collision means the command did NOT reach the inverter."""
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.RATE_LIMITED
+
+    outcome = dc.apply_mode_with_outcome(hold_entry())
+
+    assert outcome is ApplyOutcome.RATE_LIMITED
+    assert outcome.applied is False          # must not look like success
+    assert outcome.confirmed is False
+    assert dc.apply_mode(charge_entry()) is False
+    assert "WARNING" in app.levels()
+    # A retry is scheduled rather than the command being dropped.
+    assert any(
+        cb == dc._retry_command for cb, _d, _k, _h in app.run_in_calls
+    )
+    assert dc.get_diagnostics()["rate_limited_count"] == 2
+
+
+def test_rate_limited_retry_resends_and_can_succeed():
+    """The deferred command is re-sent after the cooldown and then lands."""
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.RATE_LIMITED
+
+    dc.apply_mode(hold_entry())
+    assert len(backend.sent) == 1
+
+    # Cooldown has passed; the retry now succeeds.
+    backend.send_result = SendResult.CONFIRMED
+    retry = [c for c in app.run_in_calls if c[0] == dc._retry_command][-1]
+    retry[0](retry[2])
+
+    assert len(backend.sent) == 2
+    assert backend.sent[1].action is ControlAction.HOLD
+    assert dc.last_apply_outcome is ApplyOutcome.SENT
+
+
+def test_rate_limited_does_not_record_last_sent():
+    """A deferred command must not suppress the retry as a duplicate."""
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.RATE_LIMITED
+
+    dc.apply_mode(hold_entry())
+
+    assert dc._last_action_sent is None
+    assert dc._last_command is None
+
+
+# ---------------------------------------------------------------------------
+# verify-after-set
 # ---------------------------------------------------------------------------
 
 def test_verify_match_does_not_resend():
-    """Sensor reports the expected status -> no resend."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Preserve SOC"  # hold -> Preserve SOC
+    dc, app, backend = make_dc()
+    matching(backend)
 
     dc.apply_mode(hold_entry())
-    calls_before = len(app.service_calls)
+    sends_before = len(backend.sent)
 
     app.fire_last_timer()
 
-    assert len(app.service_calls) == calls_before  # no extra service call
+    assert len(backend.sent) == sends_before
 
 
 def test_verify_mismatch_resends_once_and_rechecks():
-    """Sensor reports a different status -> resend once, then re-check ONCE.
-
-    Changed semantics (was: resend and never look again). Without the re-check
-    the log could never distinguish "the HA modbus sensor merely lagged" from
-    "the inverter really dropped back to Passthrough" — the production log shows
-    30 mismatches with no evidence either way.
-    """
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"  # expected Preserve SOC
+    """Mismatch -> resend once, then re-check ONCE (bounded ladder)."""
+    dc, app, backend = make_dc()
+    mismatching(backend, actual="Passthrough")
 
     dc.apply_mode(hold_entry())
-    calls_before = len(app.service_calls)
+    sends_before = len(backend.sent)
 
     app.fire_last_timer()
 
-    # exactly one additional set_wit_mode call (the resend)
-    assert len(app.service_calls) == calls_before + 1
+    assert len(backend.sent) == sends_before + 1
     assert "WARNING" in app.levels()
-    # exactly one follow-up verification, at the (shorter) re-check delay
     assert len(app.run_in_calls) == 2
     assert app.run_in_calls[1][2]["attempt"] == 2
     assert app.run_in_calls[1][1] == dc._verify_recheck_delay
@@ -300,20 +368,18 @@ def test_verify_mismatch_resends_once_and_rechecks():
 
 
 def test_second_verification_after_resend_matches_logs_recovery():
-    """The sensor catches up after the resend -> recovery is recorded."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+    dc, app, backend = make_dc()
+    mismatching(backend, actual="Passthrough")
 
     dc.apply_mode(hold_entry())
     app.fire_last_timer()                       # attempt 1: mismatch -> resend
-    calls_after_resend = len(app.service_calls)
+    sends_after_resend = len(backend.sent)
 
-    # Sensor now reflects the mode (it was simply lagging the coordinator poll).
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Preserve SOC"
+    matching(backend)                           # the read was merely lagging
     app.fire_last_timer()                       # attempt 2: match
 
-    assert len(app.service_calls) == calls_after_resend   # no third send
-    assert len(app.run_in_calls) == 2                     # no third timer
+    assert len(backend.sent) == sends_after_resend   # no third send
+    assert len(app.run_in_calls) == 2                # no third timer
     diag = dc.get_diagnostics()
     assert diag["resend_recovered_count"] == 1
     assert diag["persistent_mismatch_count"] == 0
@@ -321,18 +387,15 @@ def test_second_verification_after_resend_matches_logs_recovery():
 
 
 def test_persistent_mismatch_escalates_to_error_and_does_not_loop():
-    """Sensor never agrees -> ERROR after the re-check, and the ladder STOPS."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+    dc, app, backend = make_dc()
+    mismatching(backend, actual="Passthrough")
 
     dc.apply_mode(hold_entry())
-    sends_after_apply = len(app.service_calls)
+    sends_after_apply = len(backend.sent)
     app.fire_last_timer()   # attempt 1: mismatch -> resend + schedule attempt 2
     app.fire_last_timer()   # attempt 2: still mismatch -> ERROR, stop
 
-    # Exactly two sends in total: the original and one resend.
-    assert len(app.service_calls) == sends_after_apply + 1
-    # Exactly two timers: the first check and the single re-check.
+    assert len(backend.sent) == sends_after_apply + 1
     assert len(app.run_in_calls) == 2
     diag = dc.get_diagnostics()
     assert diag["persistent_mismatch_count"] == 1
@@ -346,31 +409,44 @@ def test_persistent_mismatch_escalates_to_error_and_does_not_loop():
 
 
 def test_failed_resend_is_counted_and_stops_the_ladder():
-    """A resend that fails outright is counted and does not re-check."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+    dc, app, backend = make_dc()
+    mismatching(backend, actual="Passthrough")
 
     dc.apply_mode(hold_entry())
-    app.call_service_raise = RuntimeError("boom")
+    backend.send_raise = RuntimeError("boom")
     app.fire_last_timer()
 
     assert dc.get_diagnostics()["resend_failed_count"] == 1
     assert len(app.run_in_calls) == 1  # no re-check after a failed resend
-    assert any(lvl == "ERROR" and "resend of hold failed" in m for m, lvl in app.logs)
+    assert any(lvl == "ERROR" and "resend of hold failed" in m
+               for m, lvl in app.logs)
 
 
-def test_verify_delay_and_timeout_are_configurable():
-    """apps.yaml can compensate a lagging modbus sensor without a code change."""
-    dc, app = make_dc(
+def test_rate_limited_resend_also_stops_the_ladder():
+    """A resend deferred by the cooldown is not a re-check opportunity."""
+    dc, app, backend = make_dc()
+    mismatching(backend, actual="Passthrough")
+
+    dc.apply_mode(hold_entry())
+    backend.send_result = SendResult.RATE_LIMITED
+    app.fire_last_timer()
+
+    assert dc.get_diagnostics()["resend_failed_count"] == 1
+    assert len(app.run_in_calls) == 1
+
+
+def test_verify_delays_and_timeout_are_configurable():
+    """apps.yaml can compensate a lagging read without a code change."""
+    dc, app, backend = make_dc(
         verify_delay_seconds=30,
         verify_recheck_seconds=20,
-        set_wit_mode_timeout_seconds=10,
+        command_timeout_seconds=10,
     )
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+    mismatching(backend)
 
     dc.apply_mode(hold_entry())
 
-    assert app.service_calls[0][1]["hass_timeout"] == 10
+    assert dc._command_timeout == 10
     assert app.run_in_calls[0][1] == 30
 
     app.fire_last_timer()
@@ -379,20 +455,25 @@ def test_verify_delay_and_timeout_are_configurable():
 
 def test_get_diagnostics_shape():
     """The diagnostics sensor payload is stable and starts at zero."""
-    dc, _app = make_dc()
+    dc, _app, _backend = make_dc()
     diag = dc.get_diagnostics()
 
     expected_keys = {
         "mismatch_count", "resend_count", "resend_recovered_count",
         "resend_failed_count", "persistent_mismatch_count",
         "unverifiable_count", "verified_count", "last_mismatch",
+        "last_effect", "release_pending_count",
         "verify_delay_seconds", "verify_recheck_seconds",
-        "set_wit_mode_timeout_seconds",
+        "command_timeout_seconds",
         # Per-outcome tally: a dry run, a suppressed duplicate and an
         # unconfirmed timeout are all "True" from apply_mode, and only
-        # sent_count means the inverter acknowledged anything.
+        # sent_count means the inverter acknowledged anything. A rate-limited
+        # command is none of those — it was deferred.
         "sent_count", "unconfirmed_count", "duplicate_skipped_count",
-        "dry_run_count", "failed_count", "last_apply_outcome",
+        "dry_run_count", "failed_count", "rate_limited_count",
+        "last_apply_outcome",
+        # Merged in from the backend.
+        "backend",
     }
     assert set(diag) == expected_keys
     assert diag["last_mismatch"] is None
@@ -403,10 +484,31 @@ def test_get_diagnostics_shape():
     )
 
 
+def test_backend_diagnostics_are_merged():
+    """Backend counters reach the health sensor through DirectControl."""
+    dc, _app, backend = make_dc()
+    backend.get_diagnostics = lambda: {"session_state": "active", "arm_failures": 2}
+
+    diag = dc.get_diagnostics()
+
+    assert diag["session_state"] == "active"
+    assert diag["arm_failures"] == 2
+
+
+def test_broken_backend_diagnostics_do_not_break_the_sensor():
+    dc, _app, backend = make_dc()
+
+    def boom():
+        raise RuntimeError("nope")
+
+    backend.get_diagnostics = boom
+
+    diag = dc.get_diagnostics()
+    assert diag["sent_count"] == 0
+
+
 def test_unverifiable_reads_are_counted():
-    """A sensor that can't be read is counted separately from a mismatch."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "unavailable"
+    dc, app, backend = make_dc()  # verdict defaults to UNVERIFIABLE
 
     dc.apply_mode(hold_entry())
     app.fire_last_timer()
@@ -417,59 +519,42 @@ def test_unverifiable_reads_are_counted():
     assert diag["resend_count"] == 0
 
 
-def test_verify_mismatch_bypasses_duplicate_suppression():
-    """The resend goes out even though params match the last send."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "Passthrough"
+def test_unverifiable_does_not_resend():
+    dc, app, backend = make_dc()
 
     dc.apply_mode(hold_entry())
-    # last_mode_time is recent -> _is_duplicate would normally suppress.
-    assert dc._is_duplicate("hold", dc._last_params) is True
-
-    calls_before = len(app.service_calls)
-    app.fire_last_timer()
-    assert len(app.service_calls) == calls_before + 1
-
-
-def test_verify_unavailable_sensor_does_not_resend():
-    """Unavailable/unknown sensor -> cannot verify -> no resend."""
-    dc, app = make_dc()
-    app.states[DEFAULT_MODE_STATUS_ENTITY] = "unavailable"
-
-    dc.apply_mode(hold_entry())
-    calls_before = len(app.service_calls)
+    sends_before = len(backend.sent)
 
     app.fire_last_timer()
 
-    assert len(app.service_calls) == calls_before
-    # First unreadable occurrence surfaces at WARNING (see dedicated test for
-    # the WARNING-then-DEBUG progression).
+    assert len(backend.sent) == sends_before
     assert "WARNING" in app.levels()
 
 
-def test_verify_missing_sensor_state_none_does_not_crash():
-    """get_state returns None -> cannot verify, no crash, no resend."""
-    dc, app = make_dc()
-    # DEFAULT_MODE_STATUS_ENTITY not in states -> get_state returns None
+def test_verify_mismatch_bypasses_duplicate_suppression():
+    """The resend goes out even though the command matches the last send."""
+    dc, app, backend = make_dc()
+    mismatching(backend, actual="Passthrough")
 
     dc.apply_mode(hold_entry())
-    calls_before = len(app.service_calls)
+    assert dc._is_duplicate(dc._last_command) is True
 
+    sends_before = len(backend.sent)
     app.fire_last_timer()
+    assert len(backend.sent) == sends_before + 1
 
-    assert len(app.service_calls) == calls_before
 
-
-def test_verify_uses_configured_entity_when_set():
-    """A configured inverter_mode_sensor overrides the default entity id."""
-    dc, app = make_dc(inverter_mode_sensor="sensor.custom_mode")
-    app.states["sensor.custom_mode"] = "Preserve SOC"
+def test_effect_verdict_is_recorded_on_a_match():
+    """The EFFECT level surfaces in diagnostics without gating the ladder."""
+    dc, app, backend = make_dc()
+    matching(backend)
+    backend.effect = EffectVerdict.INDETERMINATE
 
     dc.apply_mode(hold_entry())
-    calls_before = len(app.service_calls)
     app.fire_last_timer()
 
-    assert len(app.service_calls) == calls_before  # matched -> no resend
+    assert dc.get_diagnostics()["last_effect"] == "indeterminate"
+    assert dc.get_diagnostics()["verified_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -477,70 +562,71 @@ def test_verify_uses_configured_entity_when_set():
 # ---------------------------------------------------------------------------
 
 def test_new_apply_supersedes_pending_verification():
-    """Applying a new mode cancels the previous verification timer."""
-    dc, app = make_dc()
+    dc, app, backend = make_dc()
 
-    dc.apply_mode(hold_entry())          # schedules timer_1
+    dc.apply_mode(hold_entry())
     first_handle = app.run_in_calls[0][3]
 
-    dc.apply_mode(charge_entry())        # different mode -> not a duplicate
+    dc.apply_mode(charge_entry())
 
     assert first_handle in app.cancelled
-    assert len(app.run_in_calls) == 2    # a fresh timer for the new mode
+    assert len(app.run_in_calls) == 2
 
 
 # ---------------------------------------------------------------------------
-# release_control (passthrough) also verifies
+# release_control (passthrough)
 # ---------------------------------------------------------------------------
 
 def test_release_control_schedules_verification():
-    dc, app = make_dc()
-    app.call_service_return = {"success": True}
+    dc, app, backend = make_dc()
 
     result = dc.release_control()
 
     assert result is True
-    assert dc._last_mode_sent == "passthrough"
+    assert backend.released == 1
+    assert dc._last_action_sent == "passthrough"
     assert len(app.run_in_calls) == 1
-    assert app.run_in_calls[0][2]["mode_str"] == "passthrough"
+    assert app.run_in_calls[0][2]["command"].action is ControlAction.PASSTHROUGH
 
 
-def test_release_control_timeout_none_is_unconfirmed():
-    dc, app = make_dc()
-    app.call_service_return = None
+def test_release_control_unconfirmed_is_still_true():
+    dc, app, backend = make_dc()
+    backend.release_result = SendResult.UNCONFIRMED
 
     result = dc.release_control()
 
     assert result is True
-    assert dc._last_mode_sent == "passthrough"
+    assert dc._last_action_sent == "passthrough"
     assert "WARNING" in app.levels()
     assert len(app.run_in_calls) == 1
 
 
 def test_release_control_failure_returns_false():
-    dc, app = make_dc()
-    app.call_service_raise = RuntimeError("boom")
+    dc, app, backend = make_dc()
+    backend.release_raise = RuntimeError("boom")
 
     result = dc.release_control()
 
     assert result is False
-    assert dc._last_mode_sent is None
+    assert dc._last_action_sent is None
     assert len(app.run_in_calls) == 0
 
 
+def test_release_control_rate_limited_returns_false():
+    """A deferred release must not be reported as a completed handover."""
+    dc, app, backend = make_dc()
+    backend.release_result = SendResult.RATE_LIMITED
+
+    assert dc.release_control() is False
+    assert dc._last_action_sent is None
+
+
 # ---------------------------------------------------------------------------
-# apply_mode_with_outcome: the boolean's three flavours of "True"
-#
-# apply_mode returns True for a dry run, for a duplicate that was never
-# transmitted and for an unconfirmed client-side timeout. The orchestrator used
-# that boolean for health accounting, so a hung growatt_modbus (timeouts, no
-# exception) published climbing apply_successes and the "inverter is NOT
-# following the schedule" escalation could never fire.
+# apply_mode_with_outcome: the boolean's flavours of "True"
 # ---------------------------------------------------------------------------
 
 def test_outcome_confirmed_send_is_sent():
-    dc, app = make_dc()
-    app.call_service_return = {"success": True}
+    dc, app, backend = make_dc()
 
     assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.SENT
     assert dc.last_apply_outcome is ApplyOutcome.SENT
@@ -550,8 +636,8 @@ def test_outcome_confirmed_send_is_sent():
 
 
 def test_outcome_timeout_is_unconfirmed_not_sent():
-    dc, app = make_dc()
-    app.call_service_return = None
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.UNCONFIRMED
 
     outcome = dc.apply_mode_with_outcome(hold_entry())
 
@@ -564,29 +650,29 @@ def test_outcome_timeout_is_unconfirmed_not_sent():
 
 
 def test_outcome_duplicate_is_skipped_and_nothing_is_transmitted():
-    dc, app = make_dc()
+    dc, app, backend = make_dc()
 
     assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.SENT
     assert (dc.apply_mode_with_outcome(hold_entry())
             is ApplyOutcome.SKIPPED_DUPLICATE)
 
-    assert len(app.service_calls) == 1  # the duplicate never went out
+    assert len(backend.sent) == 1  # the duplicate never went out
     assert dc.get_diagnostics()["duplicate_skipped_count"] == 1
 
 
 def test_outcome_dry_run_when_no_device_id():
-    dc, app = make_dc(device_id="")
+    dc, app, backend = make_dc(device_id="")
 
     assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.DRY_RUN
 
-    assert app.service_calls == []
+    assert backend.sent == []
     assert dc.get_diagnostics()["dry_run_count"] == 1
     assert dc.get_diagnostics()["sent_count"] == 0
 
 
-def test_outcome_success_false_response_is_failed():
-    dc, app = make_dc()
-    app.call_service_return = {"success": False, "error": "nope"}
+def test_outcome_failed_result_is_failed():
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.FAILED
 
     assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.FAILED
     assert dc.apply_mode(hold_entry()) is False  # boolean wrapper agrees
@@ -594,8 +680,49 @@ def test_outcome_success_false_response_is_failed():
 
 
 def test_outcome_exception_is_failed():
-    dc, app = make_dc()
-    app.call_service_raise = RuntimeError("boom")
+    dc, app, backend = make_dc()
+    backend.send_raise = RuntimeError("boom")
 
     assert dc.apply_mode_with_outcome(hold_entry()) is ApplyOutcome.FAILED
     assert dc.get_diagnostics()["failed_count"] == 1
+
+
+def test_dry_run_backend_result_is_reported_as_dry_run():
+    """A dry-run backend must not look like a confirmed send."""
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.DRY_RUN
+
+    outcome = dc.apply_mode_with_outcome(hold_entry())
+
+    assert outcome is ApplyOutcome.DRY_RUN
+    assert outcome.confirmed is False
+    assert dc.get_diagnostics()["sent_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Release lifecycle: pending is accepted-but-not-done
+# ---------------------------------------------------------------------------
+
+def test_pending_release_is_accepted_but_warns_it_is_not_finished():
+    """The handover is only complete once read-back confirms 30100=0."""
+    dc, app, backend = make_dc()
+    backend.release_result = SendResult.PENDING
+
+    result = dc.release_control()
+
+    assert result is True                     # accepted, retrying
+    assert "WARNING" in app.levels()
+    assert any("NOT released yet" in m for m, _lvl in app.logs)
+    assert any("RELEASED before stopping" in m for m, _lvl in app.logs)
+    assert dc.get_diagnostics()["release_pending_count"] == 1
+    # A pending release must not be recorded as a completed passthrough.
+    assert dc._last_action_sent is None
+
+
+def test_pending_send_is_treated_as_not_applied():
+    dc, app, backend = make_dc()
+    backend.send_result = SendResult.PENDING
+
+    outcome = dc.apply_mode_with_outcome(hold_entry())
+
+    assert outcome.applied is False

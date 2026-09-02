@@ -1,46 +1,40 @@
-"""Direct inverter control via growatt_modbus/set_wit_mode service.
+"""Inverter control policy — deduplication, verification, outcome accounting.
 
-Sends mode commands to the WIT inverter via HA service calls
-instead of writing TOU registers.
+This module deliberately knows NOTHING about Modbus registers or Home Assistant
+service names.  All of that lives behind a :class:`ControlBackend`
+(``control/backend.py``), so swapping the underlying Growatt integration is a
+constructor argument rather than a rewrite of the policy that survived several
+production incidents.
+
+What stays here, unchanged in behaviour:
+
+* the five-way :class:`ApplyOutcome` accounting that separates "the inverter
+  acknowledged" from "nothing was transmitted" from "we never found out";
+* duplicate suppression within half a slot;
+* the BOUNDED two-step verify-after-set ladder (max 2 checks, 2 sends);
+* the diagnostics counters that make inverter-control health observable.
 """
+
+from __future__ import annotations
 
 import datetime
 import enum
 from typing import Optional
 
+from .control import (
+    ControlAction,
+    InverterCommand,
+    SendResult,
+    UpstreamVppBackend,
+    resolve_ac_charge_mode,
+    resolve_action,
+)
 from .models import BatteryMode, ScheduleEntry
 
-# Default entity id of the integration's "Inverter Mode" sensor
-# (GrowattWitModeStatusSensor). Its friendly name is "<entry> Inverter Mode"
-# and, because that sensor does NOT use has_entity_name, the entity_id is
-# derived directly from that slugified name. The id therefore depends on the
-# config entry NAME:
-#   entry "Growatt"     -> sensor.growatt_inverter_mode      (this deployment)
-#   entry "Growatt WIT" -> sensor.growatt_wit_inverter_mode
-# This deployment's other entities are prefixed "growatt_" (e.g.
-# sensor.growatt_battery_battery_soc), so the entry is named "Growatt" and the
-# default below matches. If yours differs, set config.inverter_mode_sensor —
-# a mismatch is surfaced by a WARNING the first time verification can't read
-# the sensor.
-DEFAULT_MODE_STATUS_ENTITY = "sensor.growatt_inverter_mode"
-
-# Expected value of the Inverter Mode sensor for each mode string we send.
-# Mirrors _compute_wit_mode_status() in the integration's coordinator.
-MODE_STATUS_MAP = {
-    "grid_charge": "Grid Charge",
-    "hold": "Preserve SOC",
-    "preserve_soc": "Preserve SOC",
-    "max_export": "Max Export",
-    "discharge_to_grid": "Discharge to Grid",
-    "discharge_to_load": "Discharge to Load",
-    "passthrough": "Passthrough",
-}
-
-# Default delay before verifying a sent mode against the inverter's reported
-# status. The status sensor is recomputed on each coordinator poll (~30-60s), so
-# 90s gives at least one poll cycle after the write settles. Overridable via
-# config.verify_delay_seconds: a lagging sensor and a lost command look
-# identical at a fixed delay.
+# Default delay before verifying a sent command against inverter read-back.
+# The coordinator refreshes on each poll (~30-60s), so 90s gives at least one
+# poll cycle after the write settles. Overridable via config.verify_delay_seconds:
+# a lagging read and a lost command look identical at a fixed delay.
 VERIFY_DELAY_SECONDS = 90
 
 # Default delay for the SINGLE re-check performed after a resend. Shorter than
@@ -48,31 +42,30 @@ VERIFY_DELAY_SECONDS = 90
 # needed to see it.
 VERIFY_RECHECK_SECONDS = 60
 
-# Per-call websocket timeout for set_wit_mode (AppDaemon >= 4.4 HASS kwarg).
-# The handler performs 6-9 sequential Modbus writes behind a shared lock and can
-# exceed AppDaemon's 10s default. This call is SYNCHRONOUS on the callback
-# thread, so every second here blocks every other callback of this app; the
-# unconfirmed (None) path is safe because verify-after-set covers it. Overridable
-# via config.set_wit_mode_timeout_seconds.
-SET_WIT_MODE_TIMEOUT_SECONDS = 15
+# Per-command timeout budget passed to the backend.
+COMMAND_TIMEOUT_SECONDS = 15
 
 
 class ApplyOutcome(enum.Enum):
     """What actually happened to one ``apply_mode`` command.
 
-    The boolean returned by ``apply_mode`` cannot separate these, and THREE of
+    The boolean returned by ``apply_mode`` cannot separate these, and three of
     them are True: a dry run, a duplicate that was never transmitted, and a
     client-side timeout nobody confirmed. Treating all three as "the inverter
-    obeyed" is what let a hung growatt_modbus publish climbing apply_successes
+    obeyed" is what let a hung integration publish climbing apply_successes
     while the "inverter is NOT following the schedule" escalation could never
-    fire — every call timed out at ``hass_timeout``, logged a WARNING and
-    returned True.
+    fire.
+
+    ``RATE_LIMITED`` means the command was NOT applied because a per-register
+    cooldown refused it. It is neither success nor evidence of ill health — it
+    is deferred, and a retry is scheduled.
     """
 
-    SENT = "sent"                        # confirmed by the service response
+    SENT = "sent"                        # confirmed by read-back or response
     UNCONFIRMED_TIMEOUT = "unconfirmed"  # client-side timeout, outcome unknown
     SKIPPED_DUPLICATE = "duplicate"      # identical command, nothing transmitted
-    DRY_RUN = "dry_run"                  # device_id == "" — nothing transmitted
+    DRY_RUN = "dry_run"                  # nothing transmitted
+    RATE_LIMITED = "rate_limited"        # refused by cooldown; retry scheduled
     FAILED = "failed"                    # confirmed failure
 
     @property
@@ -80,46 +73,55 @@ class ApplyOutcome(enum.Enum):
         """True only when the inverter actually acknowledged the command."""
         return self is ApplyOutcome.SENT
 
+    @property
+    def applied(self) -> bool:
+        """False whenever the inverter is definitely NOT running this command."""
+        return self not in (ApplyOutcome.FAILED, ApplyOutcome.RATE_LIMITED)
+
 
 class DirectControl:
-    """Sends mode commands to WIT inverter via HA service calls."""
+    """Applies schedule entries to the inverter through a ControlBackend."""
 
-    def __init__(self, app, config):
+    def __init__(self, app, config, backend=None):
         """
         Args:
-            app: AppDaemon app instance (for call_service, get_state, log,
-                 run_in, cancel_timer)
+            app: AppDaemon app instance (for get_state, log, run_in, cancel_timer)
             config: BatteryOptimizerConfig instance
+            backend: ControlBackend implementation. Defaults to
+                :class:`UpstreamVppBackend`, which is dry-run unless given a
+                live executor.
         """
         self.app = app
         self.config = config
-        self._last_mode_sent: Optional[str] = None
+        self.backend = backend if backend is not None else UpstreamVppBackend(app, config)
+
+        self._last_action_sent: Optional[str] = None
         self._last_mode_time: Optional[datetime.datetime] = None
-        self._last_params: dict = {}
+        self._last_command: Optional[InverterCommand] = None
+
         # Handle of the pending one-shot verification timer (from run_in), or
         # None. Superseded whenever a new mode is applied.
         self._verify_timer = None
-        # Whether the "cannot verify — mode sensor unreadable" condition has
-        # been logged at WARNING yet. First occurrence per app start is a
-        # WARNING (a wrong entity id must be visible); the rest are DEBUG.
+        # Handle of a pending retry after a rate-limited command.
+        self._retry_timer = None
+        # Whether the "cannot verify" condition has been logged at WARNING yet.
         self._verify_unreadable_warned = False
 
-        # Timing (configurable — a lagging modbus sensor must be compensable
-        # from apps.yaml, not by editing this module).
+        # Timing (configurable — a lagging read must be compensable from
+        # apps.yaml, not by editing this module).
         self._verify_delay = int(
             getattr(config, "verify_delay_seconds", VERIFY_DELAY_SECONDS)
         )
         self._verify_recheck_delay = int(
             getattr(config, "verify_recheck_seconds", VERIFY_RECHECK_SECONDS)
         )
-        self._set_mode_timeout = int(
-            getattr(config, "set_wit_mode_timeout_seconds",
-                    SET_WIT_MODE_TIMEOUT_SECONDS)
+        self._command_timeout = int(
+            getattr(config, "command_timeout_seconds", COMMAND_TIMEOUT_SECONDS)
         )
 
-        # Diagnostics counters. They exist to separate "the HA sensor lags"
+        # Diagnostics counters. They exist to separate "the read lags"
         # (mismatch_count high, resend_recovered_count high, persistent 0) from
-        # "the inverter really falls back to Passthrough" (persistent grows).
+        # "the inverter really drops the override" (persistent grows).
         self._mismatch_count = 0
         self._resend_count = 0
         self._resend_recovered_count = 0
@@ -127,11 +129,11 @@ class DirectControl:
         self._persistent_mismatch_count = 0
         self._unverifiable_count = 0
         self._verified_count = 0
+        self._rate_limited_count = 0
+        self._release_pending_count = 0
         self._last_mismatch: Optional[dict] = None
+        self._last_effect: Optional[str] = None
 
-        # Outcome of the last apply_mode command, and a tally per outcome.
-        # These are what separate "the inverter acknowledged N commands" from
-        # "N commands timed out unconfirmed" / "N were never transmitted".
         self.last_apply_outcome: Optional[ApplyOutcome] = None
         self._apply_outcome_counts: dict = {}
 
@@ -142,137 +144,138 @@ class DirectControl:
     def _duration_for_slot(self) -> int:
         """Override duration: slot_minutes + safety buffer.
 
-        If the optimizer misses a refresh, the override expires and
-        the inverter reverts to its panel-configured base mode.
+        If the optimizer misses a refresh, the override expires and the
+        inverter reverts to its panel-configured base mode.
         """
         return self.config.slot_minutes + self.config.direct_control_buffer_minutes
 
+    # --- command construction --------------------------------------------
+
+    def build_command(self, entry: ScheduleEntry) -> InverterCommand:
+        """Translate one ScheduleEntry into a backend-agnostic command."""
+        action = resolve_action(entry, self.config.default_power_percent)
+
+        charge_cutoff = None
+        discharge_cutoff = None
+        if entry.mode == BatteryMode.CHARGE:
+            charge_cutoff = self._get_max_soc()
+        if entry.mode == BatteryMode.DISCHARGE:
+            discharge_cutoff = self._get_min_soc()
+
+        return InverterCommand(
+            action=action,
+            power_percent=self.config.default_power_percent,
+            duration_minutes=self._duration_for_slot(),
+            export_rate=entry.export_rate,
+            ac_charge_mode=resolve_ac_charge_mode(
+                entry, self._get_pv_power(), self._get_pv_threshold()
+            ),
+            charge_cutoff_soc=charge_cutoff,
+            discharge_cutoff_soc=discharge_cutoff,
+            reason=entry.reason,
+        )
+
+    # --- applying ---------------------------------------------------------
+
     def apply_mode(self, entry: ScheduleEntry) -> bool:
-        """Send mode command to inverter via set_wit_mode service.
-
-        Backward-compatible boolean wrapper around
-        :meth:`apply_mode_with_outcome`: False only for a CONFIRMED failure.
-        Callers that need to distinguish "the inverter acknowledged" from
-        "nothing was transmitted" or "we never found out" must use
-        ``apply_mode_with_outcome`` (or read ``last_apply_outcome``).
-
-        Args:
-            entry: Schedule entry with mode, and optional export_rate
-                   and ac_charge_mode.
+        """Send a mode command to the inverter.
 
         Returns:
-            True unless the service call confirmed a failure.
+            False when the inverter is definitely NOT running the command — a
+            confirmed failure or a rate-limited (deferred) one. Callers that
+            need to distinguish "acknowledged" from "nothing was transmitted"
+            must use ``apply_mode_with_outcome``.
         """
-        return self.apply_mode_with_outcome(entry) is not ApplyOutcome.FAILED
+        return self.apply_mode_with_outcome(entry).applied
 
     def apply_mode_with_outcome(self, entry: ScheduleEntry) -> ApplyOutcome:
-        """Send mode command to inverter and report what actually happened.
-
-        Args:
-            entry: Schedule entry with mode, and optional export_rate
-                   and ac_charge_mode.
-
-        Returns:
-            The :class:`ApplyOutcome` for this command. Also stored on
-            ``self.last_apply_outcome`` and counted in ``get_diagnostics()``.
-        """
+        """Send a mode command and report what actually happened."""
         if not self.device_id:
             self.app.log(
                 f"DirectControl: dry-run {entry.mode.name} ({entry.reason})"
             )
             return self._record_outcome(ApplyOutcome.DRY_RUN)
 
-        mode = entry.mode
-        duration = self._duration_for_slot()
+        command = self.build_command(entry)
 
-        mode_str = {
-            BatteryMode.CHARGE: self._resolve_charge_mode(entry),
-            BatteryMode.DISCHARGE: self._resolve_discharge_mode(entry),
-            BatteryMode.HOLD: "hold",
-        }.get(mode, "hold")
-
-        params = {
-            "device_id": self.device_id,
-            "mode": mode_str,
-            "duration_minutes": duration,
-        }
-
-        # Power percent
-        params["power_percent"] = self.config.default_power_percent
-
-        # Export rate
-        if entry.export_rate is not None:
-            params["export_rate"] = entry.export_rate
-
-        # AC charge mode
-        ac_mode = self._ac_charge_mode_for_entry(entry)
-        if ac_mode:
-            params["ac_charge_mode"] = ac_mode
-
-        # SOC limits
-        if mode == BatteryMode.CHARGE:
-            params["charge_cutoff_soc"] = self._get_max_soc()
-
-        if mode == BatteryMode.DISCHARGE:
-            params["discharge_cutoff_soc"] = self._get_min_soc()
-
-        # Duplicate detection
-        if self._is_duplicate(mode_str, params):
+        if self._is_duplicate(command):
             self.app.log(
-                f"DirectControl: skipping duplicate {mode_str} "
+                f"DirectControl: skipping duplicate {command.action.value} "
                 f"(last sent {self._seconds_since_last():.0f}s ago)",
                 level="DEBUG",
             )
             return self._record_outcome(ApplyOutcome.SKIPPED_DUPLICATE)
 
-        # Supersede any verification pending from a previous send BEFORE we send
-        # (regardless of this send's outcome). Otherwise a confirmed failure
-        # here would return without cancelling, and the stale timer could later
-        # resend the now-superseded older mode.
+        return self._dispatch(command)
+
+    def _dispatch(self, command: InverterCommand) -> ApplyOutcome:
+        """Send one already-built command and account for the result."""
+        # Supersede any verification pending from a previous send BEFORE we
+        # send. Otherwise a confirmed failure here would return without
+        # cancelling, and the stale timer could later resend an older command.
         self._cancel_verification()
 
-        self.app.log(
-            f"DirectControl: {mode_str} "
-            f"power={params.get('power_percent', '-')}% "
-            f"duration={duration}min "
-            f"export={params.get('export_rate', '-')} "
-            f"ac={params.get('ac_charge_mode', '-')} "
-            f"soc=[{params.get('discharge_cutoff_soc', '-')}"
-            f"-{params.get('charge_cutoff_soc', '-')}]"
-        )
+        self.app.log(f"DirectControl: {command.describe()}")
 
-        outcome = self._call_set_wit_mode(params)
+        result = self._send(command)
 
-        if outcome is False:
+        if result is SendResult.FAILED:
             # Confirmed failure: do NOT record last-sent, so duplicate
             # suppression can't mask an immediate resend on the next slot.
             self.app.log(
-                f"DirectControl: set_wit_mode reported failure for {mode_str}; "
-                "not recording last-sent so a resend can correct it",
+                f"DirectControl: backend reported failure for "
+                f"{command.action.value}; not recording last-sent so a resend "
+                f"can correct it",
                 level="ERROR",
             )
             return self._record_outcome(ApplyOutcome.FAILED)
 
-        # outcome is True (confirmed) or None (unconfirmed — client-side
-        # timeout, command usually still applied). In both cases record the
-        # last-sent marker so the schedule isn't spammed with resends;
-        # verify-after-set (below) catches genuine losses.
-        self._last_mode_sent = mode_str
-        self._last_mode_time = datetime.datetime.now()
-        self._last_params = params.copy()
-
-        if outcome is None:
+        if result is SendResult.RATE_LIMITED:
+            # The command was NOT applied. Not a health signal — but it must
+            # not be silently dropped either, so a retry is scheduled.
+            self._rate_limited_count += 1
             self.app.log(
-                f"DirectControl: {mode_str} unconfirmed (client-side timeout); "
-                "will verify against inverter mode sensor",
+                f"DirectControl: {command.action.value} deferred — a control "
+                f"register is still in its write cooldown. Retrying shortly.",
+                level="WARNING",
+            )
+            self._schedule_retry(command)
+            return self._record_outcome(ApplyOutcome.RATE_LIMITED)
+
+        if result is SendResult.DRY_RUN:
+            return self._record_outcome(ApplyOutcome.DRY_RUN)
+
+        if result is SendResult.PENDING:
+            # Only the release path produces this today; treat it defensively
+            # as "not applied" rather than silently as a success.
+            return self._record_outcome(ApplyOutcome.RATE_LIMITED)
+
+        # CONFIRMED or UNCONFIRMED: record the last-sent marker so the schedule
+        # isn't spammed with resends; verify-after-set catches genuine losses.
+        self._last_action_sent = command.action.value
+        self._last_mode_time = datetime.datetime.now()
+        self._last_command = command
+
+        if result is SendResult.UNCONFIRMED:
+            self.app.log(
+                f"DirectControl: {command.action.value} unconfirmed "
+                f"(client-side timeout); will verify against inverter read-back",
                 level="WARNING",
             )
 
-        self._schedule_verification(mode_str, params)
+        self._schedule_verification(command)
         return self._record_outcome(
-            ApplyOutcome.SENT if outcome is True
+            ApplyOutcome.SENT if result is SendResult.CONFIRMED
             else ApplyOutcome.UNCONFIRMED_TIMEOUT
         )
+
+    def _send(self, command: InverterCommand) -> SendResult:
+        """Call the backend, converting an unexpected raise into FAILED."""
+        try:
+            return self.backend.send(command)
+        except Exception as e:
+            self.app.log(f"DirectControl: backend send failed: {e}", level="ERROR")
+            return SendResult.FAILED
 
     def _record_outcome(self, outcome: ApplyOutcome) -> ApplyOutcome:
         """Store and count one apply outcome, then return it unchanged."""
@@ -283,102 +286,104 @@ class DirectControl:
         return outcome
 
     def release_control(self) -> bool:
-        """Release all overrides — inverter reverts to base mode."""
+        """Release all overrides — inverter reverts to local control."""
         if not self.device_id:
             self.app.log("DirectControl: dry-run release_control (passthrough)")
             return True
 
-        params = {"device_id": self.device_id, "mode": "passthrough"}
-
-        # Cancel any pending verification from a previous send before sending,
-        # so a failed release can't leave a stale timer that resends an older
-        # mode ~90s later.
+        # Cancel any pending verification before sending, so a failed release
+        # can't leave a stale timer that resends an older mode later.
         self._cancel_verification()
 
-        outcome = self._call_set_wit_mode(params)
+        try:
+            result = self.backend.release()
+        except Exception as e:
+            self.app.log(f"DirectControl: release failed: {e}", level="ERROR")
+            return False
 
-        if outcome is False:
+        if result is SendResult.FAILED:
             self.app.log("DirectControl: release failed", level="ERROR")
             return False
 
-        self._last_mode_sent = "passthrough"
-        self._last_mode_time = datetime.datetime.now()
-        self._last_params = params.copy()
-
-        if outcome is None:
+        if result is SendResult.RATE_LIMITED:
+            self._rate_limited_count += 1
             self.app.log(
-                "DirectControl: passthrough unconfirmed (client-side timeout); "
-                "will verify against inverter mode sensor",
-                level="WARNING",
-            )
-        else:
-            self.app.log("DirectControl: released all overrides (passthrough)")
-
-        self._schedule_verification("passthrough", params)
-        return True
-
-    def _call_set_wit_mode(self, params: dict) -> Optional[bool]:
-        """Call the set_wit_mode service and classify the outcome.
-
-        Returns:
-            True  - confirmed success (handler returned success=True, or a
-                    truthy response we couldn't disprove)
-            False - confirmed failure (handler raised -> exception here, or an
-                    explicit success=False in the response)
-            None  - unconfirmed. AppDaemon returns None on a client-side
-                    websocket timeout regardless of how high hass_timeout is;
-                    the command usually still executes on the inverter. We can't
-                    tell slow from lost, so we defer to verify-after-set. This is
-                    why a SHORT timeout is safe: the failure mode of a too-short
-                    timeout is one extra verification, while a long one blocks
-                    the whole app's callback thread.
-        """
-        try:
-            # hass_timeout: a formal parameter of the AppDaemon HASS plugin
-            #   (>= 4.4). It is consumed by the plugin, NOT forwarded as
-            #   service data, and raises the 10s default to 30s.
-            # No return_response/return_result kwarg is passed: set_wit_mode is
-            #   registered SupportsResponse.OPTIONAL, and AppDaemon auto-enables
-            #   return_response for such services, so call_service already
-            #   surfaces the handler's response dict (or None on client-side
-            #   timeout) and propagates handler exceptions. Passing an unknown
-            #   kwarg like return_result would be forwarded to HA's strict
-            #   voluptuous schema and fail every call with "extra keys not
-            #   allowed".
-            result = self.app.call_service(
-                "growatt_modbus/set_wit_mode",
-                hass_timeout=self._set_mode_timeout,
-                **params,
-            )
-        except Exception as e:
-            self.app.log(
-                f"DirectControl: set_wit_mode failed: {e}",
-                level="ERROR",
+                "DirectControl: release deferred by write cooldown", level="WARNING"
             )
             return False
 
-        if result is None:
-            return None
+        if result is SendResult.PENDING:
+            # The release was ACCEPTED and is completing on a scheduled retry —
+            # revoking authority is commonly blocked by the cooldown our own
+            # acquisition stamped. This is not a failure, but it is also not
+            # done: the handover is only complete once read-back confirms
+            # 30100=0, which the health sensor reports as RELEASED.
+            self._release_pending_count += 1
+            self.app.log(
+                "DirectControl: release in progress — authority revoke is "
+                "waiting on the write cooldown. The inverter is NOT released "
+                "yet; wait for control_status RELEASED before stopping or "
+                "reloading AppDaemon.",
+                level="WARNING",
+            )
+            return True
 
-        # Response shape from the handler on success:
-        #   {"success": True, "mode_applied": ..., "registers_written": {...},
-        #    "timestamp": ..., "override_expires": ...}
-        # The handler raises on failure (caught above), so success=False is
-        # unusual, but honour it if a future version returns it. Tolerate the
-        # response being nested under a "result" key on some AD versions.
-        if isinstance(result, dict):
-            success = result.get("success")
-            if success is None and isinstance(result.get("result"), dict):
-                success = result["result"].get("success")
-            if success is False:
-                return False
+        command = InverterCommand(action=ControlAction.PASSTHROUGH)
+        self._last_action_sent = ControlAction.PASSTHROUGH.value
+        self._last_mode_time = datetime.datetime.now()
+        self._last_command = command
 
+        if result is SendResult.UNCONFIRMED:
+            self.app.log(
+                "DirectControl: passthrough unconfirmed (client-side timeout); "
+                "will verify against inverter read-back",
+                level="WARNING",
+            )
+        elif result is SendResult.CONFIRMED:
+            self.app.log("DirectControl: released all overrides (passthrough)")
+
+        if result is not SendResult.DRY_RUN:
+            self._schedule_verification(command)
         return True
 
-    def _mode_status_entity(self) -> str:
-        """Entity id of the inverter mode-status sensor used for verification."""
-        return getattr(self.config, "inverter_mode_sensor", "") \
-            or DEFAULT_MODE_STATUS_ENTITY
+    # --- retry after a deferred (rate-limited) command --------------------
+
+    def _schedule_retry(self, command: InverterCommand) -> None:
+        """Retry a rate-limited command once the cooldown can have expired."""
+        self._cancel_retry()
+        delay = int(getattr(self.config, "wit_cooldown_seconds", 30)) + 2
+        try:
+            self._retry_timer = self.app.run_in(
+                self._retry_command, delay, command=command
+            )
+        except Exception as e:
+            self.app.log(
+                f"DirectControl: could not schedule retry: {e}", level="ERROR"
+            )
+            self._retry_timer = None
+
+    def _cancel_retry(self) -> None:
+        if self._retry_timer is not None:
+            try:
+                self.app.cancel_timer(self._retry_timer)
+            except Exception:
+                pass
+            self._retry_timer = None
+
+    def _retry_command(self, kwargs=None) -> None:
+        """AppDaemon scheduler callback: re-send a deferred command."""
+        self._retry_timer = None
+        kwargs = kwargs or {}
+        command = kwargs.get("command")
+        if command is None:
+            return
+        self.app.log(
+            f"DirectControl: retrying deferred {command.action.value} "
+            f"after write cooldown"
+        )
+        self._dispatch(command)
+
+    # --- verification -----------------------------------------------------
 
     def _cancel_verification(self) -> None:
         """Cancel any pending verification timer."""
@@ -390,28 +395,23 @@ class DirectControl:
             self._verify_timer = None
 
     def _schedule_verification(
-        self, mode_str: str, params: dict, attempt: int = 1
+        self, command: InverterCommand, attempt: int = 1
     ) -> None:
-        """Schedule a one-shot verification after a mode was sent.
+        """Schedule a one-shot verification after a command was sent.
 
         Supersedes any previously pending verification, so a mode applied
         between send and verify cancels the stale check.
 
         Args:
-            attempt: 1 for the check after the original send (delayed by
-                verify_delay_seconds), 2 for the single re-check after a resend
-                (delayed by verify_recheck_seconds). Attempt is capped at 2 in
-                _verify_mode, so this can never become a resend loop.
+            attempt: 1 for the check after the original send, 2 for the single
+                re-check after a resend. Capped at 2 in _verify_mode, so this
+                can never become a resend loop.
         """
         self._cancel_verification()
         delay = self._verify_delay if attempt <= 1 else self._verify_recheck_delay
         try:
             self._verify_timer = self.app.run_in(
-                self._verify_mode,
-                delay,
-                mode_str=mode_str,
-                params=params.copy(),
-                attempt=attempt,
+                self._verify_mode, delay, command=command, attempt=attempt
             )
         except Exception as e:
             self.app.log(
@@ -421,9 +421,7 @@ class DirectControl:
             self._verify_timer = None
 
     def _verify_mode(self, kwargs=None) -> None:
-        """Verify the inverter reached the last-sent mode; resend once if not.
-
-        AppDaemon scheduler callback: receives a single kwargs dict.
+        """Verify the inverter reached the last-sent command; resend once if not.
 
         Attempt ladder (bounded — never a loop):
           attempt 1: mismatch -> WARNING, resend once, schedule attempt 2
@@ -431,59 +429,56 @@ class DirectControl:
                      mismatch -> ERROR, NO further resend, NO further timer
 
         The second check is what makes the diagnostics meaningful: without it we
-        never learned whether the resend helped, so a lagging HA modbus sensor
-        was indistinguishable from an inverter that genuinely drops back to
-        Passthrough.
+        never learn whether the resend helped, so a lagging read is
+        indistinguishable from an inverter that genuinely drops the override.
         """
         self._verify_timer = None
         kwargs = kwargs or {}
-        mode_str = kwargs.get("mode_str")
-        params = kwargs.get("params", {})
+        command = kwargs.get("command")
         attempt = int(kwargs.get("attempt", 1) or 1)
+        if command is None:
+            return
+
+        action_name = command.action.value
 
         try:
-            expected = MODE_STATUS_MAP.get(mode_str)
-            if expected is None:
-                return  # Unknown mode string — nothing to verify against.
+            state = self.backend.read_state()
+            result = self.backend.verify(command, state)
 
-            entity = self._mode_status_entity()
-            state = self.app.get_state(entity)
-
-            if state is None or state in ("unknown", "unavailable"):
+            if result.unverifiable:
                 # Cannot verify — don't resend blindly. Warn the FIRST time so a
-                # wrong/misconfigured entity id is visible; stay DEBUG after that
-                # to avoid log spam when the sensor is merely briefly offline.
+                # misconfiguration is visible; stay DEBUG after that.
                 self._unverifiable_count += 1
                 if not self._verify_unreadable_warned:
                     self._verify_unreadable_warned = True
                     self.app.log(
-                        f"DirectControl: cannot verify {mode_str} — mode sensor "
-                        f"'{entity}' is {state}. If this persists, check that "
-                        "inverter_mode_sensor points at the integration's "
-                        "Inverter Mode sensor (verification is disabled until "
-                        "it reads a value).",
+                        f"DirectControl: cannot verify {action_name} — inverter "
+                        f"state is unreadable ({result.actual}). Verification is "
+                        f"disabled until it reads a value.",
                         level="WARNING",
                     )
                 else:
                     self.app.log(
-                        f"DirectControl: cannot verify {mode_str} — "
-                        f"{entity} is {state}",
+                        f"DirectControl: cannot verify {action_name} — "
+                        f"{result.actual}",
                         level="DEBUG",
                     )
                 return
 
-            if str(state) == expected:
+            if result.matched:
                 self._verified_count += 1
+                self._last_effect = result.effect.value
                 if attempt > 1:
                     self._resend_recovered_count += 1
                     self.app.log(
-                        f"DirectControl: {mode_str} recovered after resend — "
-                        f"inverter now reports '{state}'"
+                        f"DirectControl: {action_name} recovered after resend — "
+                        f"inverter reports '{result.actual}'"
                     )
                 else:
                     self.app.log(
-                        f"DirectControl: verified {mode_str} — "
-                        f"inverter reports '{state}'",
+                        f"DirectControl: verified {action_name} — "
+                        f"inverter reports '{result.actual}' "
+                        f"(effect: {result.effect.value})",
                         level="DEBUG",
                     )
                 return
@@ -491,76 +486,80 @@ class DirectControl:
             self._mismatch_count += 1
             self._last_mismatch = {
                 "time": datetime.datetime.now().isoformat(timespec="seconds"),
-                "mode": mode_str,
-                "expected": expected,
-                "actual": str(state),
+                "mode": action_name,
+                "expected": command.describe(),
+                "actual": result.actual,
                 "attempt": attempt,
             }
 
             if attempt >= 2:
                 # Already resent once and the inverter still disagrees. This is
-                # no longer sensor lag — escalate and STOP (no third send, no
-                # third timer).
+                # no longer read lag — escalate and STOP (no third send).
                 self._persistent_mismatch_count += 1
                 self.app.log(
                     f"DirectControl: persistent mode mismatch after resend — "
-                    f"expected '{expected}' for {mode_str}, inverter still "
-                    f"reports '{state}'. The inverter is not honouring the "
-                    f"command; not resending again (retry happens next slot).",
+                    f"expected {action_name}, inverter reports "
+                    f"'{result.actual}' ({result.detail}). The inverter is not "
+                    f"honouring the command; not resending again (retry happens "
+                    f"next slot).",
                     level="ERROR",
                 )
                 return
 
-            # Mismatch — resend the same params ONCE, bypassing duplicate
+            # Mismatch — resend the same command ONCE, bypassing duplicate
             # suppression by clearing the last-sent timestamp.
             self.app.log(
-                f"DirectControl: mode mismatch — expected '{expected}' for "
-                f"{mode_str}, inverter reports '{state}'; resending once",
+                f"DirectControl: mode mismatch — expected {action_name}, "
+                f"inverter reports '{result.actual}' ({result.detail}); "
+                f"resending once",
                 level="WARNING",
             )
             self._last_mode_time = None  # bypass _is_duplicate
             self._resend_count += 1
-            outcome = self._call_set_wit_mode(params)
+            outcome = self._send(command)
 
-            if outcome is False:
+            if outcome is SendResult.FAILED or outcome is SendResult.RATE_LIMITED:
                 self._resend_failed_count += 1
                 self.app.log(
-                    f"DirectControl: resend of {mode_str} failed",
+                    f"DirectControl: resend of {action_name} failed "
+                    f"({outcome.value})",
                     level="ERROR",
                 )
                 return
 
             # Record last-sent again, then re-check exactly ONCE so we learn
             # whether the resend actually took effect.
-            self._last_mode_sent = mode_str
+            self._last_action_sent = action_name
             self._last_mode_time = datetime.datetime.now()
-            self._last_params = params.copy()
-            self._schedule_verification(mode_str, params, attempt=2)
+            self._last_command = command
+            self._schedule_verification(command, attempt=2)
 
         except Exception as e:
             self.app.log(
-                f"DirectControl: verification error for {mode_str}: {e}",
+                f"DirectControl: verification error for {action_name}: {e}",
                 level="ERROR",
             )
+
+    # --- diagnostics ------------------------------------------------------
 
     def get_diagnostics(self) -> dict:
         """Counters that make inverter-control health observable in HA.
 
         Interpretation:
           * mismatch_count high, resend_recovered_count ~= resend_count,
-            persistent_mismatch_count == 0  -> the HA mode sensor merely LAGS.
+            persistent_mismatch_count == 0  -> the read merely LAGS.
             Raise verify_delay_seconds.
           * persistent_mismatch_count growing -> the inverter genuinely drops
-            the override (e.g. back to Passthrough). A configuration/firmware
-            problem, not a timing one.
-          * resend_failed_count growing -> the set_wit_mode service itself is
-            failing; check the Modbus connection.
+            the override. A configuration/firmware problem, not a timing one.
+          * resend_failed_count growing -> the backend itself is failing;
+            check the Modbus connection.
           * unconfirmed_count growing while sent_count stays flat -> every
-            set_wit_mode call is hitting its client-side timeout. That is a hung
-            growatt_modbus, even though apply_mode keeps returning True.
+            command is hitting its client-side timeout.
+          * rate_limited_count growing -> commands are colliding with the
+            per-register write cooldown; they were deferred, not applied.
         """
         counts = self._apply_outcome_counts
-        return {
+        diagnostics = {
             "sent_count": counts.get(ApplyOutcome.SENT, 0),
             "unconfirmed_count": counts.get(ApplyOutcome.UNCONFIRMED_TIMEOUT, 0),
             "duplicate_skipped_count": counts.get(
@@ -568,6 +567,7 @@ class DirectControl:
             ),
             "dry_run_count": counts.get(ApplyOutcome.DRY_RUN, 0),
             "failed_count": counts.get(ApplyOutcome.FAILED, 0),
+            "rate_limited_count": counts.get(ApplyOutcome.RATE_LIMITED, 0),
             "last_apply_outcome": (
                 self.last_apply_outcome.value if self.last_apply_outcome else None
             ),
@@ -578,40 +578,23 @@ class DirectControl:
             "persistent_mismatch_count": self._persistent_mismatch_count,
             "unverifiable_count": self._unverifiable_count,
             "verified_count": self._verified_count,
+            "release_pending_count": self._release_pending_count,
             "last_mismatch": self._last_mismatch,
+            "last_effect": self._last_effect,
             "verify_delay_seconds": self._verify_delay,
             "verify_recheck_seconds": self._verify_recheck_delay,
-            "set_wit_mode_timeout_seconds": self._set_mode_timeout,
+            "command_timeout_seconds": self._command_timeout,
         }
 
-    def _ac_charge_mode_for_entry(self, entry: ScheduleEntry) -> str:
-        """Determine AC charge mode based on entry and PV conditions."""
-        if entry.ac_charge_mode is not None:
-            return entry.ac_charge_mode
+        try:
+            backend_diagnostics = self.backend.get_diagnostics()
+        except Exception:
+            backend_diagnostics = {}
+        if isinstance(backend_diagnostics, dict):
+            diagnostics.update(backend_diagnostics)
+        return diagnostics
 
-        if entry.mode == BatteryMode.CHARGE:
-            pv_power = self._get_pv_power()
-            if pv_power is not None and pv_power > self._get_pv_threshold():
-                return "pv_priority"
-            return "ac_priority"
-
-        return "disabled"
-
-    def _resolve_charge_mode(self, entry: ScheduleEntry) -> str:
-        """Map CHARGE to service mode string."""
-        return "grid_charge"
-
-    def _resolve_discharge_mode(self, entry: ScheduleEntry) -> str:
-        """Map DISCHARGE + export_rate to specific mode string."""
-        export_rate = entry.export_rate
-
-        if export_rate is not None and export_rate > 0:
-            power = self.config.default_power_percent
-            if export_rate >= 100 and power >= 100:
-                return "max_export"
-            return "discharge_to_grid"
-        # Default: no accidental export
-        return "discharge_to_load"
+    # --- HA entity reads --------------------------------------------------
 
     def _get_pv_power(self) -> Optional[float]:
         """Read current PV power from HA sensor."""
@@ -653,11 +636,13 @@ class DirectControl:
             pass
         return int(self.config.default_max_soc)
 
-    def _is_duplicate(self, mode_str: str, params: dict) -> bool:
+    # --- duplicate suppression -------------------------------------------
+
+    def _is_duplicate(self, command: InverterCommand) -> bool:
         """Check if this command is identical to the last one sent recently."""
-        if self._last_mode_sent != mode_str:
+        if self._last_command is None or self._last_mode_time is None:
             return False
-        if not self._last_mode_time:
+        if self._last_action_sent != command.action.value:
             return False
 
         elapsed = (datetime.datetime.now() - self._last_mode_time).total_seconds()
@@ -665,12 +650,7 @@ class DirectControl:
         if elapsed > half_slot:
             return False  # Time to refresh even if same mode
 
-        for key in ("mode", "export_rate", "ac_charge_mode",
-                     "charge_cutoff_soc", "discharge_cutoff_soc"):
-            if params.get(key) != self._last_params.get(key):
-                return False
-
-        return True
+        return command.dedup_key() == self._last_command.dedup_key()
 
     def _seconds_since_last(self) -> float:
         if self._last_mode_time:

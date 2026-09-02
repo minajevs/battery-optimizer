@@ -30,6 +30,18 @@ from .pv_profile import PvProfile
 from .learning_engine import BatteryLearningEngine
 from .load_profile import LoadProfile, _quantile
 from .price_service import NordPoolPriceService
+from .control import (
+    ControlAction,
+    ControlBackend,
+    EffectVerdict,
+    InverterCommand,
+    InverterState,
+    SendResult,
+    UpstreamVppBackend,
+    VerifyResult,
+    VerifyVerdict,
+    resolve_action,
+)
 from .direct_control import DirectControl
 from .dp_optimizer import DPOptimizer, DPOptimizerConfig, DPOptimizerResult
 from .timezone_utils import (
@@ -81,6 +93,16 @@ __all__ = [
     "LoadProfile",
     "NordPoolPriceService",
     "DirectControl",
+    "ControlAction",
+    "ControlBackend",
+    "EffectVerdict",
+    "InverterCommand",
+    "InverterState",
+    "SendResult",
+    "UpstreamVppBackend",
+    "VerifyResult",
+    "VerifyVerdict",
+    "resolve_action",
     "SensorReader",
     # DP Optimizer
     "DPOptimizer",

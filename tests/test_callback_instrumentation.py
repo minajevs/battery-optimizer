@@ -38,6 +38,7 @@ class FakeOptimizer(bo.BatteryOptimizer):
         self._consecutive_apply_unconfirmed = 0
         self._apply_duplicate_count = 0
         self._apply_dry_run_count = 0
+        self._apply_rate_limited_count = 0
         self._last_terminal_warning_time = None
         self._now = datetime.datetime(2026, 7, 28, 16, 0)
 
@@ -189,7 +190,7 @@ class StubDirectControl:
             "last_mismatch": None,
             "verify_delay_seconds": 90,
             "verify_recheck_seconds": 60,
-            "set_wit_mode_timeout_seconds": 15,
+            "command_timeout_seconds": 15,
         }
         self._diag.update(diag)
 
@@ -220,7 +221,7 @@ def test_control_health_sensor_publishes_counters():
     assert attrs["apply_failures"] == 9
     assert attrs["callback_overruns"] == 70
     assert attrs["slowest_callback"] == "execute_scheduled_mode 34.0s"
-    assert attrs["set_wit_mode_timeout_seconds"] == 15
+    assert attrs["command_timeout_seconds"] == 15
 
 
 def test_control_health_state_is_a_truthy_string_when_there_are_no_mismatches():

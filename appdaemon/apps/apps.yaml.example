@@ -91,6 +91,14 @@ battery_optimizer:
   # Find this in Home Assistant Developer Tools > States > growatt entities
   device_id: "YOUR_GROWATT_WIT_DEVICE_ID"  # <-- Set your device_id here
 
+  # How the control backend may talk to the inverter. This, NOT device_id, is
+  # what decides whether anything is ever written.
+  #   dry_run    - plan and log register sequences, no I/O at all (default)
+  #   read_only  - real register/entity READS; writes remain impossible
+  # Live writes are a separate, later opt-in. Anything unrecognised falls back
+  # to dry_run: a typo must never be what grants write access to an inverter.
+  control_mode: "dry_run"
+
   # ==========================================================================
   # Battery Parameters
   # ==========================================================================
@@ -259,20 +267,52 @@ battery_optimizer:
   # ==========================================================================
   # Inverter Control Timing / Blocking
   # ==========================================================================
-  # set_wit_mode is a SYNCHRONOUS service call on the AppDaemon callback thread:
+  # Inverter service calls are SYNCHRONOUS on the AppDaemon callback thread:
   # every second of this timeout blocks every other callback of this app. A
   # client-side timeout is NOT a lost command — verify-after-set covers it — so
   # a short window is the safe choice. Also give AppDaemon more than one thread
   # (appdaemon.yaml -> appdaemon: total_threads: 4).
-  set_wit_mode_timeout_seconds: 15
+  # (The old name set_wit_mode_timeout_seconds is still accepted.)
+  command_timeout_seconds: 15
 
-  # Verify-after-set. The integration recomputes its Inverter Mode sensor on
-  # each coordinator poll (~30-60s), so the sensor LAGS a write. If the log
-  # shows many "mode mismatch ... resending once" lines that all recover on the
-  # re-check (sensor.battery_inverter_control_health -> resend_recovered_count),
+  # Verify-after-set. Verification reads registers back through the control
+  # backend, and the coordinator refreshes on each poll (~30-60s), so a read
+  # LAGS a write. If the log shows many "mode mismatch ... resending once"
+  # lines that all recover on the re-check
+  # (sensor.battery_inverter_control_health -> resend_recovered_count),
   # raise verify_delay_seconds rather than chasing the inverter.
-  verify_delay_seconds: 90       # first check after a mode is sent
+  verify_delay_seconds: 90       # first check after a command is sent
   verify_recheck_seconds: 60     # the single re-check after a resend
+
+  # The integration rate-limits the VPP control registers (30100, 30200/30201,
+  # 30407/30408/30409) to one write per 30s EACH, stamped on success. A
+  # collision means the command was DEFERRED, not applied; DirectControl
+  # schedules a retry rather than dropping it.
+  wit_cooldown_seconds: 30
+
+  # Seconds between revoking control authority (30100=0) and disarming remote
+  # control (30407=0) on release. SCHEDULED, never slept on.
+  release_settle_seconds: 35
+
+  # Register 30476 (priority mode) is writable on some WIT models and not
+  # others, and may be what remote grid charging depends on. "auto" uses it
+  # only once a supervised commissioning probe has CONFIRMED it is genuinely
+  # writable; "never" leaves it alone entirely.
+  priority_mode_write: "auto"
+
+  # ==========================================================================
+  # EFFECT verification: proving the inverter is TRADING, not just moving
+  # ==========================================================================
+  # Signed INSTANTANEOUS power. The battery_charge/discharge_sensor entries
+  # elsewhere are kWh counters and cannot resolve a 60-90s window.
+  # NOTE the two sign conventions are OPPOSITE:
+  #   battery_power_sensor: positive = CHARGING
+  #   grid_power_sensor:    positive = EXPORTING
+  # A grid-charge that charges the battery from PV surplus with no grid import
+  # is INDETERMINATE, not success — which is why both are needed.
+  battery_power_sensor: "sensor.growatt_battery_battery_power"
+  grid_power_sensor: "sensor.growatt_grid_grid_power"
+  effect_threshold_w: 200
 
   # Warn when one of this app's callbacks blocks the thread for longer than this
   # (AppDaemon's own "Excessive time spent in callback" limit is 10s).
