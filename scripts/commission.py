@@ -10,12 +10,28 @@ anywhere near it.
         --token <long-lived token> --device-id <growatt device id> \
         --operation state
 
-`state` is read-only and needs no --confirm. The other four write:
+`state` is read-only and needs no --confirm. The others write:
 
-    hold     open a timed VPP session at +1 % (the least energetic command)
-    renew    re-arm the watchdog on the session THIS process opened
-    release  give the inverter back to its own local logic
-    probe    write 30476 to a different value, read it back, restore it
+    session-test  HOLD -> timed renewal experiment -> RELEASE, start to
+                  finish in this one process. THE ONE TO RUN FIRST.
+    hold          open a timed VPP session at +1 %
+    renew         re-arm the watchdog on the session THIS process opened
+    release       give the inverter back to its own local logic
+    probe         write 30476 to a different value, read it back, restore it
+
+**Use `session-test`.** Ownership of a VPP session is process-local on
+purpose: it comes from this process's own successful writes and is never
+reconstructed from register values, because a register cannot tell you who
+wrote it. So a `hold` in one invocation CANNOT be renewed or released by the
+next one — that invocation would find 30100=1 it did not set, and refuse. The
+separate `hold` / `renew` / `release` operations remain for investigating a
+single step; `session-test` is what actually exercises the lifecycle.
+
+It stays alive through the whole release: RELEASED requires BOTH halves
+confirmed by read-back — 30100=0, then the delayed 30407=0 — and the timers
+that finish it exist only while this process does. Do not interrupt it. If it
+is killed anyway, the timed override expires on its own and the inverter
+returns to its base mode; that is why the hold is only minutes long.
 
 Run hold -> renew -> release first, in that order. Those three are the minimal
 VPP path (30408, 30409, 30100, 30407) and none of them touches 30476. `probe`
@@ -31,12 +47,11 @@ count is not ours. Check with `--operation state`, and switch the external
 scheduler off before commissioning. `release` is exempt: handing the inverter
 back is never blocked.
 
-`hold` and `renew` open a session that this process must also close. A single
-invocation cannot do both — that is the point — so run `release` afterwards,
-and note that revoking authority is rate-limited for 30 s by the very write
-that took it. `release` reports "in progress" and schedules its own retry;
-because a one-shot CLI exits, use --wait-for-release to hold the process open
-until read-back confirms 30100=0.
+`hold` and `renew` open a session that only THIS process can close. Revoking
+authority is rate-limited for 30 s by the very write that took it, so
+`release` reports "in progress" and schedules its own retry; because a one-shot
+CLI exits, --wait-for-release holds the process open until both halves read
+back. It defaults to 120 s for exactly that reason.
 
 Nothing here reads a schedule or a price. It proves the session machinery
 works, and nothing else.
@@ -61,7 +76,7 @@ from battery_optimizer_lib.control import (                             # noqa: 
     build_executor,
 )
 
-WRITING_OPERATIONS = ("probe", "hold", "renew", "release")
+WRITING_OPERATIONS = ("session-test", "probe", "hold", "renew", "release")
 
 
 class RestApp:
@@ -145,6 +160,24 @@ def print_state(backend) -> None:
     print(f"  SOC                       = {state.soc_percent} %")
 
 
+def make_wait(app):
+    """A `wait(seconds)` that lets real time pass AND runs due callbacks.
+
+    The release lifecycle finishes on timers this process scheduled, so a wait
+    that only slept would hang forever at the settle.
+    """
+    def wait(seconds):
+        deadline = time.time() + seconds
+        app.run_due_timers()
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(2.0, remaining))
+            app.run_due_timers()
+    return wait
+
+
 def wait_for_release(app, backend, timeout_seconds: int) -> bool:
     """Hold the process open so the scheduled release retry can complete."""
     print(f"\nwaiting up to {timeout_seconds}s for the release to confirm "
@@ -152,7 +185,7 @@ def wait_for_release(app, backend, timeout_seconds: int) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         if backend.session_state is SessionState.RELEASED:
-            print("  release CONFIRMED by read-back (30100=0)")
+            print("  release CONFIRMED by read-back (30100=0 and 30407=0)")
             return True
         if not app.pending:
             break
@@ -173,9 +206,16 @@ def main() -> int:
     parser.add_argument("--duration-minutes", type=int, default=5)
     parser.add_argument("--confirm", action="store_true",
                         help="required for any operation that writes")
-    parser.add_argument("--wait-for-release", type=int, default=0,
+    parser.add_argument("--wait-for-release", type=int, default=120,
                         metavar="SECONDS",
-                        help="after release, wait for read-back confirmation")
+                        help="after release, wait for BOTH halves to read back "
+                             "(30100=0, then the delayed 30407=0). 0 disables, "
+                             "which can leave the session settling")
+    parser.add_argument("--renew-after-seconds", type=int, default=35,
+                        help="session-test: seconds to hold the session open "
+                             "before re-arming (must clear the 30 s cooldown)")
+    parser.add_argument("--release-timeout", type=int, default=240,
+                        help="session-test: how long to wait for RELEASED")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--battery-power-direction",
                         default="negative_is_charging")
@@ -211,7 +251,14 @@ def main() -> int:
         return 0
 
     print(f"--- {args.operation} ---")
-    if args.operation == "probe":
+    if args.operation == "session-test":
+        result = session.session_test(
+            wait=make_wait(app),
+            duration_minutes=args.duration_minutes,
+            renew_after_seconds=args.renew_after_seconds,
+            release_timeout_seconds=args.release_timeout,
+        )
+    elif args.operation == "probe":
         result = session.probe_priority_mode()
     elif args.operation == "hold":
         result = session.hold(duration_minutes=args.duration_minutes)
@@ -221,13 +268,18 @@ def main() -> int:
         result = session.release()
 
     print()
+    if session.observations:
+        print("observations:")
+        for line in session.observations:
+            print(f"    {line}")
+        print()
     print(result.describe())
     print(f"session_state = {backend.session_state.value}   "
           f"safe_to_stop = {backend.session_state.safe_to_stop}")
     print()
     print_state(backend)
 
-    if args.operation == "release" and args.wait_for_release:
+    if args.operation in ("release", "session-test") and args.wait_for_release:
         wait_for_release(app, backend, args.wait_for_release)
         print()
         print_state(backend)

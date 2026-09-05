@@ -171,10 +171,21 @@ be what grants write access to an inverter.
 asks before dispatching. In commissioning the optimizer plans and logs every
 slot and transmits none of them; the only writes come from
 `CommissioningSession` (`control/commissioning.py`), driven one operation at a
-time by a person via `scripts/commission.py --confirm`. Four operations exist —
-a timed HOLD at +1%, a watchdog renewal, release, and the 30476 capability
-probe (which always restores what it changed). **Run the first three, in that
-order, before the probe**: they are the minimal VPP path (30408, 30409, 30100,
+time by a person via `scripts/commission.py --confirm`. The operation to run
+first is **`session-test`**, which performs HOLD -> a timed renewal experiment
+-> RELEASE against one backend, one session and one process, and stays alive
+until the release confirms in both halves. That grouping is forced by the
+design: session ownership is process-local (it comes from this process's own
+write results, never from register values), so a one-operation-per-invocation
+CLI *cannot* renew or release a session an earlier invocation opened — the
+next process would find `30100=1` it did not set and refuse, correctly.
+Persisting ownership to disk would mean trusting a file over the hardware.
+The individual operations remain for investigating one step — a timed HOLD at
++1%, a watchdog renewal, release, and the 30476 capability probe (which always
+restores what it changed). **HOLD and renew are confirmed by reading
+30100/30407/30409 back**; a write that did not raise is not an armed session,
+and an unverifiable one latches degraded rather than being reported as open.
+**Run the first three, in that order, before the probe**: they are the minimal VPP path (30408, 30409, 30100,
 30407) and none of them touches 30476. Proving 30476 writable licenses nothing
 by itself — it is a storage register that changes the inverter's base mode, so
 it is spent only where a hypothesis needs it, which is the later grid-charge
@@ -258,11 +269,17 @@ can never prove the inverter is doing anything.
   the backend enters `ARM_FAILED_AUTHORITY_HELD` and schedules a rollback —
   it cannot revoke immediately, because its own successful `30100=1` stamped the
   30 s cooldown that now blocks `30100=0`.
-- Release is a **lifecycle**, not a call: `ACTIVE -> RELEASE_PENDING -> 30100=0
-  -> read-back confirms -> settle -> 30407=0 -> RELEASED`. `RELEASED` means a
-  read-back said `30100 == 0`; override *timer expiry* is a different thing and
-  must not be conflated with it. `safe_to_stop` on the health sensor says when
-  it is safe to stop/reload AppDaemon.
+- Release is a **lifecycle**, not a call: `ACTIVE -> RELEASE_PENDING ->
+  30100=0 read back -> RELEASE_SETTLING -> (settle) -> 30407=0 read back ->
+  RELEASED`. **`RELEASED` requires BOTH halves confirmed by read-back**, and
+  `read_state() is None` is never one of them — an unreadable inverter means
+  "not known to be released", which is the opposite of success, so it stays
+  RELEASE_PENDING and retries. `RELEASE_SETTLING` exists because the delayed
+  `30407=0` runs on a timer this process owns: authority is already back with
+  the inverter, but stopping now strands an arm nobody owns, so
+  **`safe_to_stop` is False throughout it** and `reconcile()` may not demote it
+  (`UNFINISHED_STATES`). Override *timer expiry* is a different thing again and
+  must not be conflated with either.
 - Each command carries power_percent, duration, export_rate, ac_charge_mode, and SOC cutoffs
 - AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV
   power. This is INTENT only: register 30410 accepts 0 and 1 on the reference
@@ -304,11 +321,17 @@ can never prove the inverter is doing anything.
   30405=20, so it does not describe local-mode behaviour. The authoritative
   "do not sell below here" rule is the optimizer's own `min_soc`.
 - At startup `reconcile()` never adopts an inherited session: `30100=1 /
-  30407=1` before this process armed anything is
-  `EXTERNAL_CONTROL_PRESENT`, not `ACTIVE`. The `1/0` standby hazard is always
-  reported at CRITICAL, but a rollback is only *scheduled* when the executor
-  can actually write — queueing one from a read-only process would retry a
-  write that can never land.
+  30407=1` before this process armed anything is `AUTHORITY_HELD_NOT_OURS`,
+  not `ACTIVE`. That state is a **backend-level hard interlock**:
+  `send()` refuses every session-holding action under it, independently of the
+  30411 interlock, so automatic control cannot arm on top of inherited
+  authority merely because no supervised layer was in the way. `PASSTHROUGH`
+  and `release()` stay exempt.
+- **`authority_already_held` is an ownership question, not a register value.**
+  The acquire write is skipped only for an `ACTIVE` session this process armed
+  itself. It used to be skipped whenever `_applied[30100] == 1` — but
+  `reconcile()` seeds `_applied` from a register *read*, so any inherited
+  `30100=1` silently became a session to build on.
 - Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
 - Reliability: each call passes `hass_timeout=config.set_wit_mode_timeout_seconds` (default **15**) and inspects the service response. A raised/`success=False` result is a confirmed failure (ERROR, returns False, last-sent NOT recorded so it retries next slot). A `None` result is an unconfirmed client-side timeout (WARNING, last-sent recorded to avoid schedule spam). The timeout is short *because* the None path is safe: verify-after-set catches a genuinely lost command, whereas a long timeout blocks every other callback of this app.
 - Health accounting reads `apply_mode_with_outcome`'s `ApplyOutcome`, never the boolean: `apply_mode` returns True for three outcomes the inverter never acknowledged (`DRY_RUN`, `SKIPPED_DUPLICATE`, `UNCONFIRMED_TIMEOUT`), so only `SENT` resets `_consecutive_apply_failures`, an unconfirmed timeout escalates to the same ERROR after 3 in a row (the hung-modbus case), and a duplicate skip or dry run is neutral.

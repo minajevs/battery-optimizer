@@ -5,7 +5,20 @@ timer. Every operation is called deliberately, by a person, one at a time —
 that is what "supervised" means here, and it is the reason the first commands
 this project ever sends to an inverter are the least energetic ones.
 
-**Run them in this order:**
+**``session_test()`` is the operation to run first.** It performs the whole
+lifecycle — ``hold()`` -> a timed renewal experiment -> ``release()`` — against
+one backend, one session and one process, and stays alive until the release is
+confirmed in both halves.
+
+That grouping is not a convenience. Ownership of a VPP session is
+process-local by design: it comes from this process's own successful writes
+(``OWN_AUTHORITY_STATES``) and is never reconstructed from register values,
+because a register cannot say who wrote it. A one-operation-per-invocation CLI
+therefore *cannot* renew or release a session an earlier invocation opened —
+the later process would find 30100=1 it did not set and refuse, correctly.
+Persisting ownership to disk would fix that by trusting a file over the
+hardware, and adopting 30100 on the strength of it is exactly the inference
+this module exists to refuse. So the lifecycle runs in one process instead.
 
     1. ``hold()``     — open a timed VPP session at +1 %
     2. ``renew()``    — prove the watchdog can be re-armed
@@ -13,7 +26,8 @@ this project ever sends to an inverter are the least energetic ones.
 
 That is the minimal VPP path — 30408, 30409, 30100, 30407 and nothing else —
 and it is what the first hardware run must establish on its own. None of the
-three touches 30476.
+three touches 30476. ``hold()`` and ``renew()`` are confirmed by reading
+30100/30407/30409 back: a write that did not raise is not an armed session.
 
 ``probe_priority_mode()`` is deliberately NOT part of it. It is a supervised
 capability probe, and its result licenses nothing by itself: knowing that
@@ -55,6 +69,16 @@ from .upstream_vpp import HOLD_POWER_PERCENT, SessionState
 # inverter's watchdog rather than persisting.
 DEFAULT_COMMISSIONING_MINUTES = 5
 
+# The renewal experiment must re-arm AFTER the per-register write cooldown has
+# expired, or it measures the cooldown instead of the watchdog.
+DEFAULT_RENEW_AFTER_SECONDS = 35
+
+# How long the session test will keep waiting for a release to reach RELEASED.
+# The lifecycle is two confirmed halves plus a settle, so this is minutes, not
+# seconds: 30100=0 can be rate-limited for 30 s, then the 30407=0 cleanup is
+# scheduled release_settle_seconds later and read back after that.
+DEFAULT_RELEASE_TIMEOUT_SECONDS = 240
+
 
 @dataclass(frozen=True)
 class CommissioningResult:
@@ -84,6 +108,7 @@ class CommissioningSession:
         self.degraded = False
         self.degraded_reason: Optional[str] = None
         self.history: List[CommissioningResult] = []
+        self.observations: List[str] = []
 
     # --- logging ----------------------------------------------------------
 
@@ -276,11 +301,38 @@ class CommissioningSession:
         result = self.backend.send(command)
 
         if result is SendResult.CONFIRMED:
+            # A write that did not raise is not an armed session. Read
+            # 30100/30407/30409 back and let the registers say whether the
+            # command actually took, before this is reported as an open
+            # session the operator can act on.
+            verified = self.backend.verify(command, self.backend.read_state())
+
+            if verified.unverifiable:
+                self._degrade(
+                    f"{operation} was sent but the inverter could not be read "
+                    f"back, so there is no evidence the session is armed. A "
+                    f"session that cannot be seen is not supervised")
+                return self._record(CommissioningResult(
+                    operation=operation, ok=False, state=state,
+                    detail="sent, but read-back failed: 30100/30407/30409 "
+                           "unknown. Release before doing anything else"))
+
+            if not verified.matched:
+                self._degrade(
+                    f"{operation} was accepted but read back wrong "
+                    f"({verified.detail}); the inverter is not in the state "
+                    f"this operation asked for")
+                return self._record(CommissioningResult(
+                    operation=operation, ok=False, state=state,
+                    detail=f"read-back MISMATCH: {verified.detail} "
+                           f"(actual {verified.actual})"))
+
             return self._record(CommissioningResult(
                 operation=operation, ok=True, state=state,
                 detail=f"session armed for {duration_minutes} min at "
-                       f"+{HOLD_POWER_PERCENT}% "
-                       f"(session_state={self.backend.session_state.value})"))
+                       f"+{HOLD_POWER_PERCENT}% — confirmed by read-back of "
+                       f"30100/30407/30409 ({verified.actual}); "
+                       f"session_state={self.backend.session_state.value}"))
 
         if result is SendResult.RATE_LIMITED:
             # Deferred, not failed: a control register is still in its cooldown.
@@ -328,6 +380,13 @@ class CommissioningSession:
                 "a release is already pending; its scheduled retry is running "
                 "and will complete on its own")
 
+        if session is SessionState.RELEASE_SETTLING:
+            return self._refuse(
+                operation,
+                "a release is already settling: 30100=0 is confirmed and the "
+                "30407=0 cleanup is scheduled. Keep this process alive until "
+                "the session reads RELEASED")
+
         result = self.backend.release()
 
         if result is SendResult.CONFIRMED:
@@ -349,6 +408,153 @@ class CommissioningSession:
         return self._record(CommissioningResult(
             operation=operation, ok=False, state=state,
             detail=f"release returned {result.value}"))
+
+    # --- the long-lived supervised session test ---------------------------
+
+    def _observe(self, label: str) -> Optional[InverterState]:
+        """Read and record the four session registers, for the operator."""
+        state = self.backend.read_state()
+        if state is None:
+            line = f"{label}: inverter UNREADABLE"
+        else:
+            line = (f"{label}: 30100={state.control_authority} "
+                    f"30407={state.remote_enabled} "
+                    f"30408={state.duration_minutes} "
+                    f"30409={state.commanded_power}")
+        self.observations.append(line)
+        self._log(line)
+        return state
+
+    @staticmethod
+    def _renewal_verdict(opened, elapsed, renewed, duration_minutes) -> str:
+        """What the 30408 readings do and do not establish.
+
+        The experiment only means something if 30408 counts DOWN while a
+        session runs. On an inverter that simply echoes what was written, the
+        three readings are identical and prove nothing — which is reported as
+        inconclusive rather than dressed up as a pass.
+        """
+        readings = [s.duration_minutes if s is not None else None
+                    for s in (opened, elapsed, renewed)]
+        if any(r is None for r in readings):
+            return (f"renewal INCONCLUSIVE: 30408 could not be read "
+                    f"throughout ({readings})")
+
+        after_open, after_wait, after_renew = readings
+        if after_wait == after_open:
+            return (f"renewal INCONCLUSIVE: 30408 did not count down "
+                    f"({after_open} -> {after_wait}), so it echoes the last "
+                    f"written value rather than the remaining window. This "
+                    f"run cannot say whether re-arming renews the watchdog")
+        if after_renew > after_wait:
+            return (f"renewal WORKS: 30408 counted down {after_open} -> "
+                    f"{after_wait} and the re-arm put it back to "
+                    f"{after_renew}")
+        return (f"renewal DID NOT TAKE: 30408 went {after_open} -> "
+                f"{after_wait} and the re-arm left it at {after_renew}, "
+                f"not {duration_minutes}")
+
+    def session_test(
+        self,
+        wait,
+        duration_minutes: int = DEFAULT_COMMISSIONING_MINUTES,
+        renew_after_seconds: int = DEFAULT_RENEW_AFTER_SECONDS,
+        release_timeout_seconds: int = DEFAULT_RELEASE_TIMEOUT_SECONDS,
+        poll_seconds: int = 5,
+    ) -> CommissioningResult:
+        """HOLD -> timed renewal experiment -> RELEASE, in ONE process.
+
+        Ownership of a VPP session is deliberately process-local: it comes
+        from this process's own successful writes and is never reconstructed
+        from register values, so a one-operation-per-invocation CLI can open a
+        session it is then structurally unable to renew or release. Rather
+        than persist ownership (which would mean trusting a file over the
+        hardware, and adopting 30100 on the strength of it), the whole
+        lifecycle runs here against one backend, one session and one process.
+
+        ``wait(seconds)`` is supplied by the caller and must both let real
+        time pass AND run any scheduled callbacks that fall due — the release
+        lifecycle finishes on timers this process owns. Nothing in this module
+        sleeps on its own.
+
+        The inverter is handed back on every path out of here, including the
+        failing ones. If this process dies mid-test the watchdog expiry
+        returns the inverter to its base mode on its own, which is why the
+        hold is minutes long.
+        """
+        operation = "session_test"
+        self.observations = []
+
+        opened = self.hold(duration_minutes=duration_minutes)
+        if opened.refused:
+            # Nothing was transmitted, so there is nothing to hand back.
+            return self._record(CommissioningResult(
+                operation=operation, ok=False, refused=True,
+                detail=f"refused before opening a session: {opened.detail}"))
+
+        if not opened.ok:
+            return self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                f"HOLD did not confirm ({opened.detail}); handing the "
+                f"inverter back without attempting the renewal",
+                steps_ok=False)
+
+        after_open = self._observe("after HOLD")
+
+        wait(renew_after_seconds)
+        after_wait = self._observe(f"after {renew_after_seconds}s of session")
+
+        renewed = self.renew(duration_minutes=duration_minutes)
+        after_renew = self._observe("after RENEW")
+
+        verdict = self._renewal_verdict(
+            after_open, after_wait, after_renew, duration_minutes)
+        if not renewed.ok:
+            verdict = f"renew operation did not confirm ({renewed.detail})"
+        self.observations.append(verdict)
+        self._log(verdict)
+
+        return self._release_and_report(
+            operation, wait, release_timeout_seconds, poll_seconds, verdict,
+            steps_ok=renewed.ok)
+
+    def _release_and_report(
+        self, operation: str, wait, timeout_seconds: int, poll_seconds: int,
+        summary: str, steps_ok: bool = True,
+    ) -> CommissioningResult:
+        """Hand the inverter back and wait out the whole release lifecycle.
+
+        RELEASED needs both halves confirmed by read-back — 30100=0 and then
+        the delayed 30407=0 — so this keeps the process alive through the
+        settle rather than exiting on the first confirmation.
+
+        ``steps_ok`` carries the verdict of what came before: a clean handover
+        does not redeem a hold that never armed, so a successful release is
+        reported as a successful RELEASE, not a successful test.
+        """
+        released = self.release()
+        remaining = int(timeout_seconds)
+
+        while (self.backend.session_state is not SessionState.RELEASED
+               and remaining > 0):
+            wait(poll_seconds)
+            remaining -= poll_seconds
+
+        self._observe("after RELEASE")
+        final = self.backend.session_state
+
+        if final is SessionState.RELEASED:
+            return self._record(CommissioningResult(
+                operation=operation, ok=steps_ok,
+                detail=f"{summary}; released and confirmed "
+                       f"(30100=0 and 30407=0 both read back)"))
+
+        return self._record(CommissioningResult(
+            operation=operation, ok=False,
+            detail=f"{summary}; the session did NOT reach RELEASED within "
+                   f"{timeout_seconds}s (session_state={final.value}, "
+                   f"release returned {released.detail}). This process still "
+                   f"owns the handover — do not stop it; investigate now"))
 
     # --- reporting --------------------------------------------------------
 

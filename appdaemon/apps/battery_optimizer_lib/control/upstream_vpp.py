@@ -149,15 +149,23 @@ class SessionState(enum.Enum):
       failed to arm, leaving its own command half-applied. The trigger is our
       own failed write, never an inference from register values.
 
-    ``RELEASED`` is reserved for a read-back-confirmed 30100=0. Timer expiry of
-    the override is a different thing and must not be conflated with it: the
-    watchdog returns the inverter to its base mode, it does not clean up
-    authority.
+    * ``RELEASE_SETTLING`` — 30100=0 is confirmed, but the delayed 30407=0 has
+      not been written and read back yet. The session is not finished, and the
+      timer that finishes it only exists while this process does.
+
+    ``RELEASED`` is reserved for a session whose BOTH halves were confirmed by
+    read-back: 30100 == 0 and 30407 == 0. An unreadable inverter is never
+    confirmation -- ``read_state() is None`` means "not known to be released",
+    which is the opposite of success. Timer expiry of the override is a
+    different thing again and must not be conflated with either: the watchdog
+    returns the inverter to its base mode, it does not clean up authority.
     """
 
     NOT_ARMED = "not_armed"      # never taken authority in this process
     ACTIVE = "active"
     RELEASE_PENDING = "release_pending"
+    # Authority revoked and confirmed; the 30407=0 cleanup is still outstanding.
+    RELEASE_SETTLING = "release_settling"
     RELEASED = "released"
     ARM_FAILED_AUTHORITY_HELD = "arm_failed_authority_held"
     # 30100=1 found without this process having taken it.
@@ -177,6 +185,11 @@ class SessionState(enum.Enum):
         AUTHORITY_HELD_NOT_OURS counts as safe: we hold nothing, so there is
         nothing of ours left dangling. It is still a loud state, because what
         the optimizer plans next is not what the inverter is currently doing.
+
+        RELEASE_SETTLING is NOT safe. Authority is already back with the
+        inverter, but the scheduled 30407=0 has not run, and stopping the
+        process kills the only thing that will ever run it -- leaving the
+        inverter armed for a session nobody owns.
         """
         return self in (SessionState.NOT_ARMED, SessionState.RELEASED,
                         SessionState.AUTHORITY_HELD_NOT_OURS)
@@ -191,6 +204,15 @@ OWN_AUTHORITY_STATES = frozenset({
     # We took the authority and could not arm it. Ours, and known to be ours
     # from our own write result rather than from what the registers now read.
     SessionState.ARM_FAILED_AUTHORITY_HELD,
+})
+
+# States in which this process still has unfinished business with the inverter
+# even though authority itself reads 0. reconcile() must not demote these to
+# NOT_ARMED: that would flip safe_to_stop to True while a scheduled 30407=0 is
+# the only thing standing between the inverter and a stranded arm.
+UNFINISHED_STATES = frozenset({
+    SessionState.RELEASE_PENDING,
+    SessionState.RELEASE_SETTLING,
 })
 
 
@@ -511,6 +533,7 @@ class UpstreamVppBackend:
         self.last_grid_power_w: Optional[float] = None
         self.last_tou_period_count: Optional[int] = None
         self._release_timer = None
+        self._disarm_timer = None
 
         # Last value we successfully wrote per register — drives "write only on
         # change" for the non-EEPROM-safe registers.
@@ -527,7 +550,10 @@ class UpstreamVppBackend:
             "rollback_confirmed": 0,
             "release_attempts": 0,
             "release_deferred": 0,
+            "disarm_attempts": 0,
+            "disarm_confirmed": 0,
             "external_scheduler_refusals": 0,
+            "authority_not_ours_refusals": 0,
         }
 
     # --- configuration helpers -------------------------------------------
@@ -729,14 +755,15 @@ class UpstreamVppBackend:
                                note="signed power target"))
 
         # 3. Authority acquired LATE, so a partial failure leaves it un-armed.
-        #    Skipped when the inverter already reports 30100=1: that register
-        #    is rate-limited to one write per 30 s, and re-taking authority we
-        #    demonstrably already have spends the budget for nothing. The
-        #    read-back in reconcile() is what seeds _applied here, so an
-        #    inherited session is worked with rather than churned.
-        if self._applied.get(REG_CONTROL_AUTHORITY) == 1:
+        #    Skipped ONLY for authority this process owns -- an ACTIVE session
+        #    it armed itself and has not released. It used to be skipped
+        #    whenever _applied said 30100 was 1, but reconcile() seeds
+        #    _applied from a register READ, so any inherited 30100=1 looked
+        #    like a session of ours to build on. A register value is not
+        #    ownership; our own successful write is.
+        if self.session_state is SessionState.ACTIVE:
             plan.authority_already_held = True
-        elif self.session_state is not SessionState.ACTIVE:
+        else:
             plan.acquires_authority = True
             plan.add(RegisterWrite(REG_CONTROL_AUTHORITY, 1,
                                    note="acquire authority (late)"))
@@ -826,6 +853,26 @@ class UpstreamVppBackend:
                 f"operation. This mode transmits only "
                 f"{sorted(a.value for a in COMMISSIONING_ACTIONS)} — nothing "
                 f"was sent to the inverter.",
+                level="ERROR",
+            )
+            return SendResult.FAILED
+
+        # HARD INTERLOCK: authority we cannot account for. Independent of the
+        # TOU interlock below -- either one alone refuses. The commissioning
+        # preflight has always refused on this; putting it in the backend too
+        # means automatic control cannot arm on top of an inherited 30100=1
+        # merely because nothing supervised was in the way.
+        #
+        # Only reconcile() sets this state, and only from a read, so it never
+        # fires on authority this process took.
+        if (command.action.holds_session and not self.dry_run
+                and self.session_state is SessionState.AUTHORITY_HELD_NOT_OURS):
+            self._counters["authority_not_ours_refusals"] += 1
+            self._log(
+                f"REFUSED {command.action.value}: 30100=1 without this process "
+                f"having taken it. Authority we cannot account for is never "
+                f"armed on top of — establish what set it, or release it from "
+                f"wherever it came from. Nothing was sent.",
                 level="ERROR",
             )
             return SendResult.FAILED
@@ -923,9 +970,12 @@ class UpstreamVppBackend:
             return SendResult.FAILED
 
         if plan.action is ControlAction.PASSTHROUGH:
-            self.session_state = SessionState.RELEASED
-        else:
-            self.session_state = SessionState.ACTIVE
+            # The authority write landed. Landing is not confirmation, and
+            # confirmation of 30100 alone is not the end of the lifecycle, so
+            # this goes through exactly the same gate release() does.
+            return self._confirm_authority_revoked()
+
+        self.session_state = SessionState.ACTIVE
         return SendResult.CONFIRMED
 
     def _enter_arm_failed(self) -> None:
@@ -988,8 +1038,10 @@ class UpstreamVppBackend:
         state = self.read_state()
         if state is not None and state.control_authority == 0:
             self._counters["rollback_confirmed"] += 1
-            self.session_state = SessionState.RELEASED
             self._log("authority rollback confirmed by read-back (30100=0)")
+            # A failed arm means 30407=1 never landed, so this normally ends
+            # the lifecycle outright -- but that is checked, not assumed.
+            self._enter_settling(state)
             return
 
         # A write that merely did not raise is not proof. Keep trying.
@@ -1028,6 +1080,14 @@ class UpstreamVppBackend:
             self._log("release requested but authority was never taken")
             return SendResult.CONFIRMED
 
+        if self.session_state is SessionState.RELEASE_SETTLING:
+            # Authority is already confirmed revoked; only the scheduled
+            # 30407=0 is outstanding. Re-revoking would spend the 30100
+            # cooldown for nothing.
+            self._log("release already settling: 30100=0 is confirmed and the "
+                      "30407 disarm is scheduled")
+            return SendResult.PENDING
+
         self.session_state = SessionState.RELEASE_PENDING
         self._log(f"release requested: {len(plan.steps)} step(s)")
         for line in plan.describe():
@@ -1061,21 +1121,66 @@ class UpstreamVppBackend:
             self._schedule_release_retry(remaining)
             return SendResult.PENDING
 
+        return self._confirm_authority_revoked()
+
+    def _confirm_authority_revoked(self) -> SendResult:
+        """Believe 30100=0 only when a read-back says so, then start settling.
+
+        An unreadable inverter is explicitly NOT success. The previous version
+        treated ``read_state() is None`` as "the write stood", which turned
+        every lost read into a RELEASED that nobody had confirmed -- and
+        RELEASED is what tells the operator it is safe to stop the process.
+        """
         state = self.read_state()
-        if state is not None and state.control_authority not in (0, None):
+
+        if state is None:
+            self._log(
+                "authority revoke could NOT be confirmed: the inverter is "
+                "unreadable, which is not evidence that it was released. "
+                "Staying RELEASE_PENDING and retrying.",
+                level="WARNING",
+            )
+            self.session_state = SessionState.RELEASE_PENDING
+            self._schedule_release_retry(
+                self.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY))
+            return SendResult.PENDING
+
+        if state.control_authority != 0:
             self._log(
                 "authority revoke not yet confirmed by read-back; retrying",
                 level="WARNING",
             )
+            self.session_state = SessionState.RELEASE_PENDING
             self._schedule_release_retry(
                 self.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY)
             )
             return SendResult.PENDING
 
-        # Confirmed (or unreadable, in which case the write itself stood).
-        self._log("authority released (30100=0); disarming after settle")
+        return self._enter_settling(state)
+
+    def _enter_settling(self, state: Optional[InverterState]) -> SendResult:
+        """30100=0 is confirmed. The session ends when 30407=0 is confirmed too.
+
+        Authority is back with the inverter, so nothing is being commanded --
+        but an armed 30407 belonging to a session nobody owns is exactly the
+        litter this lifecycle exists to prevent, and the timer that clears it
+        dies with this process. Hence a state of its own, and
+        ``safe_to_stop`` stays False throughout it.
+        """
+        if state is not None and state.remote_enabled == 0:
+            # Already disarmed (a watchdog expiry, or our own earlier disarm).
+            self.session_state = SessionState.RELEASED
+            self._log("authority released and 30407 already 0 — RELEASED "
+                      "(both halves confirmed by read-back)")
+            return SendResult.CONFIRMED
+
+        self.session_state = SessionState.RELEASE_SETTLING
+        self._log(
+            f"authority released (30100=0, confirmed). Disarming 30407 after "
+            f"{self._settle_seconds()}s — the session is NOT finished and "
+            f"this process must stay alive until it reads RELEASED."
+        )
         self._schedule_disarm()
-        self.session_state = SessionState.RELEASED
         return SendResult.CONFIRMED
 
     def _schedule_release_retry(self, remaining: float) -> None:
@@ -1091,19 +1196,59 @@ class UpstreamVppBackend:
     def _settle_seconds(self) -> int:
         return int(getattr(self.config, "release_settle_seconds", 35))
 
-    def _schedule_disarm(self) -> None:
+    def _schedule_disarm(self, delay: Optional[float] = None) -> None:
         run_in = getattr(self.app, "run_in", None)
         if run_in is None:
+            self._log(
+                "no scheduler available to disarm 30407; the session cannot "
+                "reach RELEASED on its own",
+                level="ERROR",
+            )
             return
+        if delay is None:
+            delay = self._settle_seconds()
         try:
-            run_in(self._disarm, self._settle_seconds())
+            self._disarm_timer = run_in(self._disarm, max(1.0, float(delay)))
         except Exception as e:  # pragma: no cover
             self._log(f"could not schedule disarm: {e}", level="ERROR")
 
     def _disarm(self, kwargs=None) -> None:
-        self._execute_step(
+        """Write 30407=0 and read it back. Only that finishes the lifecycle."""
+        self._disarm_timer = None
+        if self.session_state is not SessionState.RELEASE_SETTLING:
+            return
+
+        self._counters["disarm_attempts"] += 1
+        result = self._execute_step(
             RegisterWrite(REG_REMOTE_ENABLE, 0, note="disarm after settle")
         )
+
+        if result is not StepResult.OK:
+            remaining = self.cooldown.seconds_remaining(REG_REMOTE_ENABLE)
+            self._log(
+                f"disarm did not land ({result.value}); the session stays "
+                f"RELEASE_SETTLING and the write is retried",
+                level="WARNING",
+            )
+            self._schedule_disarm(remaining)
+            return
+
+        state = self.read_state()
+        if state is None or state.remote_enabled != 0:
+            self._log(
+                "disarm not confirmed by read-back "
+                f"(30407={None if state is None else state.remote_enabled}); "
+                f"retrying. Not RELEASED until it reads 0.",
+                level="WARNING",
+            )
+            self._schedule_disarm(
+                self.cooldown.seconds_remaining(REG_REMOTE_ENABLE))
+            return
+
+        self._counters["disarm_confirmed"] += 1
+        self.session_state = SessionState.RELEASED
+        self._log("disarm confirmed by read-back (30407=0) — RELEASED; "
+                  "both halves of the release are now confirmed")
 
     # --- startup reconciliation -------------------------------------------
 
@@ -1189,12 +1334,14 @@ class UpstreamVppBackend:
                     "strength of these two registers alone.",
                     level="WARNING",
                 )
-        elif self.session_state not in (SessionState.RELEASED,
-                                        SessionState.RELEASE_PENDING):
+        elif (self.session_state is not SessionState.RELEASED
+                and self.session_state not in UNFINISHED_STATES):
             # Authority is not held. RELEASED is kept as-is ("we released it"
-            # is stronger and still true than "never armed"), and a pending
-            # release is left for its own scheduled retry to resolve rather
-            # than being raced by a read.
+            # is stronger and still true than "never armed"), and an
+            # unfinished release -- pending or settling -- is left for its own
+            # scheduled callback to resolve rather than being raced by a read.
+            # Demoting a settling session would report safe_to_stop=True while
+            # our own 30407=0 was still outstanding.
             self.session_state = SessionState.NOT_ARMED
 
         if state.external_scheduler_present:
@@ -1539,6 +1686,10 @@ class UpstreamVppBackend:
             "rollback_confirmed": self._counters["rollback_confirmed"],
             "release_attempts": self._counters["release_attempts"],
             "release_deferred": self._counters["release_deferred"],
+            "disarm_attempts": self._counters["disarm_attempts"],
+            "disarm_confirmed": self._counters["disarm_confirmed"],
+            "authority_not_ours_refusals": (
+                self._counters["authority_not_ours_refusals"]),
             # Telemetry, republished so normalization is verifiable on the
             # real installation: raw beside normalized makes a wrong
             # battery_power_direction obvious at a glance.

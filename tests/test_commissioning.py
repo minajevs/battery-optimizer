@@ -24,6 +24,7 @@ from battery_optimizer_lib.control import (
     ControlAction,
     HaCommissioningExecutor,
     InverterCommand,
+    InverterState,
     SendResult,
     SessionState,
     UpstreamVppBackend,
@@ -81,6 +82,11 @@ class FakeApp:
         self.run_in_calls.append((callback, delay))
         return f"timer_{self._handle}"
 
+    def fire_last_timer(self):
+        """Run the most recently scheduled callback, as AppDaemon would."""
+        callback, _delay = self.run_in_calls[-1]
+        callback()
+
     def cancel_timer(self, handle):
         pass
 
@@ -128,6 +134,22 @@ def make(registers=None, **overrides):
                                  clock=clock)
     backend.clock = clock
     return backend, app, CommissioningSession(backend, log_func=app.log)
+
+
+def make_waiter(backend, app):
+    """A `wait(seconds)` for session_test: advance the clock, run callbacks.
+
+    Mirrors what scripts/commission.py does with real sleeps and
+    RestApp.run_due_timers -- the release lifecycle finishes on timers this
+    process scheduled, so a wait that only passed time would hang at the
+    settle.
+    """
+    def wait(seconds):
+        backend.clock.advance(seconds)
+        pending, app.run_in_calls = list(app.run_in_calls), []
+        for callback, _delay in pending:
+            callback()
+    return wait
 
 
 def clean():
@@ -540,7 +562,17 @@ def test_release_revokes_authority_and_is_confirmed_by_read_back():
 
     assert result.ok is True
     assert (REG_CONTROL_AUTHORITY, 0) in app.writes
+    # Authority is confirmed back, but the session is NOT finished: 30407=0
+    # has not been written yet, so stopping here would strand the arm.
+    assert backend.session_state is SessionState.RELEASE_SETTLING
+    assert backend.session_state.safe_to_stop is False
+
+    backend.clock.advance(36)
+    app.fire_last_timer()                       # the scheduled disarm
+
+    assert (REG_REMOTE_ENABLE, 0) in app.writes
     assert backend.session_state is SessionState.RELEASED
+    assert backend.session_state.safe_to_stop is True
 
 
 def test_release_deferred_by_the_cooldown_is_reported_as_in_progress():
@@ -715,6 +747,231 @@ def test_a_commissioning_hold_is_clean_again_once_the_schedule_is_gone():
     assert result.ok is True
     assert session.degraded is False
     assert backend.session_state is SessionState.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# Read-back confirmation of HOLD and renew
+# ---------------------------------------------------------------------------
+
+def test_a_hold_is_confirmed_by_reading_30100_30407_30409_back():
+    backend, _app, session = make(clean())
+
+    result = session.hold(duration_minutes=5)
+
+    assert result.ok is True
+    assert "confirmed by read-back" in result.detail
+    assert "auth=1" in result.detail and "remote=1" in result.detail
+    assert backend.session_state is SessionState.ACTIVE
+
+
+def test_a_hold_whose_arm_did_not_take_is_not_reported_as_a_session():
+    """The write was accepted and the register did not move. Not armed."""
+    backend, app, session = make(clean())
+    app.ignore_writes.add(REG_REMOTE_ENABLE)      # accepted, value unchanged
+
+    result = session.hold(duration_minutes=5)
+
+    assert result.ok is False
+    assert "MISMATCH" in result.detail
+    assert "remote control not enabled" in result.detail
+    assert session.degraded is True
+
+
+def test_a_hold_whose_setpoint_did_not_take_is_not_reported_as_a_session():
+    backend, app, session = make(clean())
+    app.ignore_writes.add(REG_REMOTE_POWER)       # 30409 stays 0
+
+    result = session.hold(duration_minutes=5)
+
+    assert result.ok is False
+    assert "MISMATCH" in result.detail
+    assert "power" in result.detail
+    assert session.degraded is True
+
+
+def test_a_hold_that_cannot_be_read_back_is_not_a_confirmed_session():
+    """A session that cannot be seen is not a supervised one."""
+    backend, _app, session = make(clean())
+    real = backend.read_state
+    calls = {"n": 0}
+
+    def read_once_then_blind():
+        calls["n"] += 1
+        return real() if calls["n"] <= 1 else None   # 1 = preflight reconcile
+
+    backend.read_state = read_once_then_blind
+
+    result = session.hold(duration_minutes=5)
+
+    assert result.ok is False
+    assert "read-back failed" in result.detail
+    assert session.degraded is True
+
+
+def test_a_renewal_that_did_not_take_is_not_reported_as_renewed():
+    backend, app, session = make(clean())
+    session.hold(duration_minutes=5)
+    backend.clock.advance(31)
+    app.ignore_writes.add(REG_REMOTE_DURATION)    # 30408 will not move
+
+    result = session.renew(duration_minutes=7)
+
+    # 30408 is not part of verify()'s three registers, so the renewal still
+    # confirms -- what must NOT happen is a mismatch being reported as OK.
+    assert result.ok is True
+    app.ignore_writes.clear()
+    app.ignore_writes.add(REG_REMOTE_ENABLE)
+    app.registers[REG_REMOTE_ENABLE] = 0          # arm silently dropped
+    backend.clock.advance(31)
+
+    second = session.renew(duration_minutes=7)
+
+    assert second.ok is False
+    assert "MISMATCH" in second.detail
+
+
+# ---------------------------------------------------------------------------
+# The long-lived session test
+# ---------------------------------------------------------------------------
+
+def test_session_test_runs_the_whole_lifecycle_in_one_process():
+    backend, app, session = make(clean())
+
+    result = session.session_test(
+        wait=make_waiter(backend, app), duration_minutes=5,
+        renew_after_seconds=35)
+
+    assert result.ok is True
+    assert backend.session_state is SessionState.RELEASED
+    assert backend.session_state.safe_to_stop is True
+
+    operations = [r.operation for r in session.history]
+    assert operations == ["timed_hold", "timer_renewal", "release",
+                          "session_test"]
+
+    registers = [reg for reg, _v in app.writes]
+    assert registers[-1] == REG_REMOTE_ENABLE     # the disarm, last of all
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+
+
+def test_session_test_reports_what_the_renewal_experiment_showed():
+    backend, app, session = make(clean())
+
+    session.session_test(wait=make_waiter(backend, app), duration_minutes=5,
+                         renew_after_seconds=35)
+
+    text = " ".join(session.observations)
+    assert "after HOLD" in text
+    assert "after RENEW" in text
+    # This fake echoes 30408 rather than counting it down, and saying so is
+    # the honest answer -- the experiment cannot conclude from equal readings.
+    assert "renewal INCONCLUSIVE" in text
+
+
+def test_the_renewal_verdict_reads_a_counting_down_30408():
+    """On an inverter that counts 30408 down, the experiment can conclude."""
+    _backend, _app, session = make(clean())
+
+    verdict = session._renewal_verdict(
+        InverterState(duration_minutes=5),      # after HOLD
+        InverterState(duration_minutes=3),      # after waiting
+        InverterState(duration_minutes=5),      # after the re-arm
+        5)
+
+    assert "renewal WORKS" in verdict
+
+
+def test_the_renewal_verdict_reports_a_re_arm_that_did_not_take():
+    _backend, _app, session = make(clean())
+
+    verdict = session._renewal_verdict(
+        InverterState(duration_minutes=5),
+        InverterState(duration_minutes=3),
+        InverterState(duration_minutes=3),      # the re-arm changed nothing
+        5)
+
+    assert "renewal DID NOT TAKE" in verdict
+
+
+def test_the_renewal_verdict_refuses_to_conclude_from_an_unreadable_30408():
+    _backend, _app, session = make(clean())
+
+    verdict = session._renewal_verdict(
+        InverterState(duration_minutes=5), None,
+        InverterState(duration_minutes=5), 5)
+
+    assert "renewal INCONCLUSIVE" in verdict
+
+
+def test_session_test_hands_the_inverter_back_when_the_hold_does_not_confirm():
+    """Every path out of the test releases what it opened."""
+    backend, app, session = make(clean())
+    app.ignore_writes.add(REG_REMOTE_ENABLE)      # the arm will not take
+
+    result = session.session_test(
+        wait=make_waiter(backend, app), duration_minutes=5,
+        renew_after_seconds=35)
+
+    assert result.ok is False
+    assert "HOLD did not confirm" in result.detail
+    assert (REG_CONTROL_AUTHORITY, 0) in app.writes
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+
+
+def test_session_test_transmits_nothing_when_the_preflight_refuses():
+    backend, app, session = make(external_scheduler(16))
+
+    result = session.session_test(
+        wait=make_waiter(backend, app), duration_minutes=5)
+
+    assert result.ok is False
+    assert result.refused is True
+    assert "EXTERNAL SCHEDULER" in result.detail
+    assert app.writes == []
+
+
+def test_session_test_reports_a_release_that_never_confirmed():
+    """A stuck handover is this process's problem, and it says so."""
+    backend, app, session = make(clean())
+    session.hold(duration_minutes=5)
+    backend.clock.advance(31)
+    # The inverter accepts 30100=0 and keeps reading 1.
+    app.ignore_writes.add(REG_CONTROL_AUTHORITY)
+
+    result = session._release_and_report(
+        "session_test", make_waiter(backend, app), 30, 5, "summary")
+
+    assert result.ok is False
+    assert "did NOT reach RELEASED" in result.detail
+    assert backend.session_state is not SessionState.RELEASED
+    assert backend.session_state.safe_to_stop is False
+
+
+def test_a_second_process_cannot_take_over_a_session_it_did_not_open():
+    """Why the lifecycle has to run in one process.
+
+    The first backend opens a session. A second one, standing in for the next
+    CLI invocation, sees 30100=1 it cannot account for and refuses — it does
+    not adopt the session, and nothing on disk lets it.
+    """
+    backend, app, session = make(clean())
+    session.hold(duration_minutes=5)
+    assert backend.session_state is SessionState.ACTIVE
+
+    second_backend, _app2, second_session = make(app.registers)
+    second_backend.clock.advance(31)
+
+    renewed = second_session.renew(duration_minutes=5)
+    released = second_session.release()
+
+    assert renewed.refused is True
+    # It never even reaches "no session of ours to renew": the authority it
+    # can see is not accounted for, and that refuses first.
+    assert "HARD INTERLOCK" in renewed.detail
+    assert released.refused is True
+    assert "not ours to revoke" in released.detail
+    assert second_backend.session_state is SessionState.AUTHORITY_HELD_NOT_OURS
 
 
 # ---------------------------------------------------------------------------

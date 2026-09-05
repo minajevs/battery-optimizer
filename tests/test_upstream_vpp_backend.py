@@ -229,7 +229,7 @@ def test_export_rate_is_clamped_to_the_safe_range():
 
 def test_passthrough_releases_authority_and_does_not_leave_standby():
     clock = FakeClock()
-    backend, _app, ex = make_backend(clock=clock)
+    backend, app, ex = make_backend(clock=clock)
     backend.send(command(ControlAction.HOLD))
     ex.executed.clear()
     clock.advance(31)          # a real slot is 15 min away
@@ -237,6 +237,12 @@ def test_passthrough_releases_authority_and_does_not_leave_standby():
     assert backend.release() is SendResult.CONFIRMED
 
     assert (REG_CONTROL_AUTHORITY, 0) in ex.sequence()
+    assert backend.session_state is SessionState.RELEASE_SETTLING
+
+    clock.advance(36)
+    app.fire_last_timer()                       # the scheduled 30407=0
+
+    assert (REG_REMOTE_ENABLE, 0) in ex.sequence()
     assert backend.session_state is SessionState.RELEASED
 
 
@@ -1080,12 +1086,19 @@ def test_decision_log_warns_when_the_inverter_is_already_in_standby():
 # ---------------------------------------------------------------------------
 
 def test_release_completes_immediately_when_the_cooldown_allows():
+    """"Immediately" is the 30100 half. The lifetime ends at the 30407 half."""
     clock = FakeClock()
-    backend, _app, ex = make_backend(clock=clock)
+    backend, app, ex = make_backend(clock=clock)
     backend.send(command(ControlAction.HOLD))
     clock.advance(31)
 
     assert backend.release() is SendResult.CONFIRMED
+    assert backend.session_state is SessionState.RELEASE_SETTLING
+    assert backend.session_state.safe_to_stop is False
+
+    clock.advance(36)
+    app.fire_last_timer()
+
     assert backend.session_state is SessionState.RELEASED
     assert backend.session_state.safe_to_stop is True
 
@@ -1114,11 +1127,16 @@ def test_pending_release_completes_on_the_scheduled_retry():
     backend.release()
 
     clock.advance(31)
-    app.fire_last_timer()
+    app.fire_last_timer()                       # the deferred authority revoke
 
-    assert backend.session_state is SessionState.RELEASED
+    assert backend.session_state is SessionState.RELEASE_SETTLING
     assert (REG_CONTROL_AUTHORITY, 0) in ex.sequence()
     assert backend.get_diagnostics()["release_deferred"] == 1
+
+    clock.advance(36)
+    app.fire_last_timer()                       # the scheduled disarm
+
+    assert backend.session_state is SessionState.RELEASED
 
 
 def test_release_is_not_believed_without_read_back_confirmation():
@@ -1137,6 +1155,100 @@ def test_release_is_not_believed_without_read_back_confirmation():
 
     assert result is SendResult.PENDING
     assert backend.session_state is SessionState.RELEASE_PENDING
+
+
+def test_an_unreadable_inverter_is_never_a_confirmed_release():
+    """read_state() is None means "not known to be released", not success."""
+    clock = FakeClock()
+    backend, app, ex = make_backend(clock=clock)
+    backend.send(command(ControlAction.HOLD))
+    clock.advance(31)
+    ex.read_registers = lambda start, count: None      # reads go dark
+
+    result = backend.release()
+
+    assert result is SendResult.PENDING
+    assert backend.session_state is SessionState.RELEASE_PENDING
+    assert backend.session_state.safe_to_stop is False
+    assert app.run_in_calls                            # a retry is scheduled
+
+
+def test_the_session_is_not_released_until_the_disarm_is_confirmed():
+    """Both halves, each by read-back: 30100=0, then the delayed 30407=0."""
+    clock = FakeClock()
+    backend, app, ex = make_backend(clock=clock)
+    backend.send(command(ControlAction.HOLD))
+    clock.advance(31)
+    backend.release()
+
+    assert backend.session_state is SessionState.RELEASE_SETTLING
+    assert backend.session_state.safe_to_stop is False
+    assert REG_REMOTE_ENABLE not in [
+        w.register for w in ex.writes() if w.value == 0]
+
+    clock.advance(36)
+    app.fire_last_timer()
+
+    assert (REG_REMOTE_ENABLE, 0) in ex.sequence()
+    assert backend.session_state is SessionState.RELEASED
+    assert backend.get_diagnostics()["disarm_confirmed"] == 1
+
+
+def test_a_disarm_that_does_not_read_back_keeps_the_session_settling():
+    clock = FakeClock()
+    backend, app, ex = make_backend(clock=clock)
+    backend.send(command(ControlAction.HOLD))
+    clock.advance(31)
+    backend.release()
+
+    # The write is accepted; 30407 keeps reading 1.
+    original = ex.read_registers
+
+    def stubborn(start, count):
+        values = original(start, count)
+        if values is not None and start <= REG_REMOTE_ENABLE < start + count:
+            values[REG_REMOTE_ENABLE - start] = 1
+        return values
+
+    ex.read_registers = stubborn
+    clock.advance(36)
+    app.fire_last_timer()
+
+    assert backend.session_state is SessionState.RELEASE_SETTLING
+    assert backend.session_state.safe_to_stop is False
+    assert backend.get_diagnostics()["disarm_attempts"] >= 1
+    assert backend.get_diagnostics()["disarm_confirmed"] == 0
+
+
+def test_a_settling_session_is_not_demoted_by_a_reconcile():
+    """Demoting it would report safe_to_stop=True with 30407=1 outstanding."""
+    app = FakeServiceApp()
+    backend = read_only_backend(app, {30100: 0, 30407: 1})
+    backend.session_state = SessionState.RELEASE_SETTLING
+
+    backend.reconcile()
+
+    assert backend.session_state is SessionState.RELEASE_SETTLING
+    assert backend.session_state.safe_to_stop is False
+
+
+def test_a_released_session_re_acquires_authority_on_the_next_command():
+    """Ownership ends with the release; the next session takes 30100 again."""
+    clock = FakeClock()
+    backend, app, ex = make_backend(clock=clock)
+    backend.send(command(ControlAction.HOLD))
+    clock.advance(31)
+    backend.release()
+    clock.advance(36)
+    app.fire_last_timer()
+    assert backend.session_state is SessionState.RELEASED
+    ex.executed.clear()
+    clock.advance(31)
+
+    plan = backend.build_plan(command(ControlAction.HOLD))
+
+    assert plan.acquires_authority is True
+    assert plan.authority_already_held is False
 
 
 def test_release_when_never_armed_is_a_no_op():
@@ -1344,6 +1456,64 @@ def test_no_plan_ever_writes_the_tou_schedule(action):
 
 
 # ---------------------------------------------------------------------------
+# The authority interlock (AUTHORITY_HELD_NOT_OURS)
+# ---------------------------------------------------------------------------
+
+def inherited_authority(registers=None):
+    """A WRITE-CAPABLE backend that reconciled onto authority it did not take.
+
+    Write-capable on purpose: the point of the interlock is that a backend
+    which physically could arm this session declines to.
+    """
+    backend, app, ex = make_backend()
+    ex.registers.update({REG_CONTROL_AUTHORITY: 1, REG_REMOTE_ENABLE: 1,
+                         REG_TOU_NUM_PERIODS: 0})
+    ex.registers.update(registers or {})
+    backend.reconcile()
+    assert backend.session_state is SessionState.AUTHORITY_HELD_NOT_OURS
+    return backend, app, ex
+
+
+@pytest.mark.parametrize("action", [
+    ControlAction.GRID_CHARGE,
+    ControlAction.HOLD,
+    ControlAction.DISCHARGE_TO_LOAD,
+    ControlAction.DISCHARGE_TO_GRID,
+    ControlAction.MAX_EXPORT,
+])
+def test_authority_we_cannot_account_for_blocks_every_session_holding_action(action):
+    """A backend-level interlock, not one the supervised path alone enforces."""
+    backend, _app, _ex = inherited_authority()
+
+    result = backend.send(command(action))
+
+    assert result is SendResult.FAILED
+    assert backend.get_diagnostics()["authority_not_ours_refusals"] == 1
+
+
+def test_the_authority_interlock_is_independent_of_the_tou_interlock():
+    """30411=0, so only the authority half can be what refuses here."""
+    backend, app, _ex = inherited_authority({REG_TOU_NUM_PERIODS: 0})
+
+    backend.send(command(ControlAction.HOLD))
+
+    diag = backend.get_diagnostics()
+    assert diag["authority_not_ours_refusals"] == 1
+    assert diag["external_scheduler_refusals"] == 0
+    assert any("30100=1 without this process" in m and lvl == "ERROR"
+               for m, lvl in app.logs)
+
+
+def test_the_authority_interlock_does_not_block_handing_the_inverter_back():
+    backend, _app, _ex = inherited_authority()
+
+    result = backend.send(command(ControlAction.PASSTHROUGH))
+
+    assert result is not SendResult.FAILED
+    assert backend.get_diagnostics()["authority_not_ours_refusals"] == 0
+
+
+# ---------------------------------------------------------------------------
 # The external-scheduler interlock (30411 > 0)
 # ---------------------------------------------------------------------------
 
@@ -1482,11 +1652,15 @@ def test_a_cleared_schedule_is_not_reported_as_an_external_scheduler():
     assert backend.get_diagnostics()["external_scheduler_present"] is False
 
 
-def test_authority_already_held_is_not_rewritten():
-    """30100 is rate-limited; re-taking authority we have spends that for nothing."""
-    app = FakeServiceApp()
-    backend = read_only_backend(app, {30100: 1, 30407: 1})
-    backend.reconcile()
+def test_authority_this_process_owns_is_not_rewritten():
+    """30100 is rate-limited; re-taking authority we armed spends that for nothing.
+
+    Ownership comes from our own successful arm, never from a register read.
+    """
+    clock = FakeClock()
+    backend, _app, ex = make_backend(clock=clock)
+    backend.send(command(ControlAction.HOLD))       # ACTIVE, armed by us
+    clock.advance(31)
 
     plan = backend.build_plan(command(ControlAction.HOLD))
 
@@ -1496,6 +1670,25 @@ def test_authority_already_held_is_not_rewritten():
     assert plan.acquires_authority is False
     # Arming is still planned, and still last.
     assert written[-1] == REG_REMOTE_ENABLE
+
+
+def test_inherited_authority_is_not_treated_as_a_session_to_build_on():
+    """The bug this replaces: _applied[30100] came from a READ, not from us.
+
+    reconcile() seeds the write-on-change cache from register values, so an
+    inherited 30100=1 used to set authority_already_held and skip the acquire
+    — quietly adopting somebody else's authority as a session of ours.
+    """
+    app = FakeServiceApp()
+    backend = read_only_backend(app, {30100: 1, 30407: 1})
+    backend.reconcile()
+
+    assert backend.session_state is SessionState.AUTHORITY_HELD_NOT_OURS
+
+    plan = backend.build_plan(command(ControlAction.HOLD))
+
+    assert plan.authority_already_held is False
+    assert plan.acquires_authority is True
 
 
 def test_reconcile_leaves_a_clean_inverter_not_armed():
