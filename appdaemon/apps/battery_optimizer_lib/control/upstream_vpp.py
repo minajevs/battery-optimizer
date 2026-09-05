@@ -96,16 +96,32 @@ WIT_COOLDOWN_SECONDS = 30
 # have a tested restore path.
 TOU_FALLBACK_ENABLED = False
 
-# The only actions commissioning mode will transmit. Everything that moves
-# energy for money -- grid charge, either discharge, max export -- is excluded:
-# commissioning proves the SESSION machinery (take authority, arm, rewrite the
-# duration, release) and nothing else. HOLD is the least energetic way to do
-# that: +1 % keeps a session alive while moving ~100-150 W into the battery and
-# putting the house load on the grid -- small, but not nothing.
+# The only actions commissioning mode will transmit.
+#
+# HOLD and PASSTHROUGH prove the SESSION machinery (take authority, arm,
+# rewrite the duration, release) without a trade: +1 % moves ~100-150 W into
+# the battery and puts the house load on the grid -- small, but not nothing.
+#
+# DISCHARGE_TO_LOAD joins them for the FIRST energetic experiment, and it is
+# the only one that ever will without its own hardware evidence. What makes it
+# admissible is that it is the least consequential thing a VPP session can be
+# asked to do with real power: it is bounded to a few percent by
+# MAX_COMMISSIONING_DISCHARGE_PERCENT, it serves the house rather than the
+# grid, and it is transmitted under 30200=1 / 30201=0 -- an export limit of
+# zero, which is a RESTRICTION on the inverter, not a capability granted to it.
+# Grid charge, discharge-to-grid and max export stay excluded: each spends
+# money in a direction nothing here has yet observed on this hardware.
 COMMISSIONING_ACTIONS = frozenset({
     ControlAction.HOLD,
     ControlAction.PASSTHROUGH,
+    ControlAction.DISCHARGE_TO_LOAD,
 })
+
+# A supervised discharge is a small one. Ten percent of a 12 kW inverter is
+# ~1.2 kW, which is already more than the reference house draws on an ordinary
+# evening; the point of the experiment is the SIGN and the routing of the
+# power, not its magnitude.
+MAX_COMMISSIONING_DISCHARGE_PERCENT = 10
 
 # 30409 value that means "hold". NOT 0 — that is documented as "suspend forced
 # cycle (passthrough)", and 0 was observed clipping PV.
@@ -439,15 +455,21 @@ class HaCommissioningExecutor(_HaRegisterReader):
     can_read = True
     commissioning = True
 
-    # Exactly what the four supervised operations need, and nothing else.
-    # Notably absent: 30200/30201 (export limit), 30410 (AC charge),
-    # 30404/30405 (SOC cutoffs) and 30411 (the inverter's own TOU schedule).
+    # Exactly what the supervised operations need, and nothing else.
+    # Notably absent: 30410 (AC charge), 30404/30405 (SOC cutoffs) and 30411
+    # (the inverter's own TOU schedule).
     WRITABLE_REGISTERS = frozenset({
         REG_CONTROL_AUTHORITY,   # 30100 — take/release authority
         REG_REMOTE_ENABLE,       # 30407 — arm/disarm
-        REG_REMOTE_DURATION,     # 30408 — duration field (NOT enforced; see below)
-        REG_REMOTE_POWER,        # 30409 — signed setpoint (+1 % HOLD only)
+        REG_REMOTE_DURATION,     # 30408 — duration field (NOT enforced)
+        REG_REMOTE_POWER,        # 30409 — signed setpoint
         REG_PRIORITY_MODE,       # 30476 — capability probe, always restored
+        # The export limit, for the supervised discharge only. These two are
+        # here because they take capability AWAY from the inverter: 30200=1
+        # with 30201=0 says "serve the house, sell nothing". A register that
+        # can only restrict is a different kind of risk from one that commands.
+        REG_EXPORT_LIMIT_ENABLE,  # 30200
+        REG_EXPORT_LIMIT_RATE,    # 30201
     })
 
     def execute(self, step: Any) -> StepResult:
@@ -835,15 +857,33 @@ class UpstreamVppBackend:
         return plan
 
     def _build_commissioning_plan(self, command: InverterCommand) -> CommandPlan:
-        """The timed override, and nothing else.
+        """The timed override, plus an export limit for the discharge alone.
 
-        No export policy (30200/30201), no AC charge mode (30410), no SOC
-        cutoffs (30404/30405), no priority mode, no TOU (30411). Commissioning
-        proves that a VPP session can be opened, renewed and released; it does
-        not configure the inverter, and every register it does not need is a
-        register it cannot leave changed.
+        For HOLD this is the timed override and nothing else. No AC charge mode
+        (30410), no SOC cutoffs (30404/30405), no priority mode (30476), no TOU
+        (30411) -- commissioning proves that a VPP session can be opened,
+        renewed and released; it does not configure the inverter, and every
+        register it does not need is a register it cannot leave changed.
+
+        DISCHARGE_TO_LOAD adds exactly two: 30200=1 and 30201=0, an export
+        limit of zero. They are here because they CONSTRAIN the experiment --
+        the question is whether a negative 30409 serves the house, and an
+        unrestricted export target would let the answer be "it sold the power
+        instead" while looking like a success. Written before the power
+        command, so the inverter is never briefly discharging under a stale
+        export policy. 30405 stays untouched even though it is a discharge:
+        the reference WIT was seen discharging to 18 % with 30405=20, so it
+        does not describe local behaviour cleanly, and an experiment does not
+        need a second unknown in it.
         """
         plan = CommandPlan(action=command.action)
+
+        if command.action is ControlAction.DISCHARGE_TO_LOAD:
+            exp_enable, exp_rate = self._export_policy(command)
+            self._staged(plan, REG_EXPORT_LIMIT_ENABLE, exp_enable,
+                         "export limit ENABLE (constrains the experiment)")
+            self._staged(plan, REG_EXPORT_LIMIT_RATE, exp_rate,
+                         "export limit rate 0 % — serve the house, not the grid")
 
         plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
                                note="duration (not enforced)"))

@@ -103,7 +103,12 @@ from typing import Any, List, Optional, Tuple
 
 from .actions import ControlAction
 from .backend import InverterCommand, InverterState, SendResult
-from .upstream_vpp import HOLD_POWER_PERCENT, SessionState, UNFINISHED_STATES
+from .upstream_vpp import (
+    HOLD_POWER_PERCENT,
+    MAX_COMMISSIONING_DISCHARGE_PERCENT,
+    SessionState,
+    UNFINISHED_STATES,
+)
 
 # Short by design: a commissioning HOLD should not outlive the operator's
 # attention span.
@@ -140,6 +145,24 @@ DEFAULT_RENEW_AFTER_SECONDS = 35
 # left alone, does the session end by itself? So it holds for the shortest
 # window the inverter accepts and then does nothing at all, and the observation
 # has to outlast the window or it cannot see the expiry it is looking for.
+# The first experiment with real power in it. 5 % of a 12 kW inverter is
+# ~600 W, which the reference house exceeds on an ordinary evening -- so the
+# battery can satisfy the request without the grid being asked for anything,
+# which is what keeps this a test of ONE thing.
+DEFAULT_DISCHARGE_PERCENT = 5
+DEFAULT_DISCHARGE_OBSERVE_SECONDS = 60
+# Below this the experiment is refused outright. Not the optimizer's min_soc
+# (which is a policy floor) -- just a margin wide enough that a minute of
+# discharge cannot approach any reserve.
+DEFAULT_DISCHARGE_MIN_SOC = 30.0
+# How much more negative than the baseline the battery must go before this is
+# called an effect rather than noise. Local discharge already varies by tens of
+# watts minute to minute.
+DEFAULT_DISCHARGE_EFFECT_W = 150.0
+# Export above this is not "negligible" any more. 30200=1 / 30201=0 says sell
+# nothing; a few tens of watts is measurement noise around zero.
+DEFAULT_EXPORT_TOLERANCE_W = 50.0
+
 DEFAULT_WATCHDOG_MINUTES = MIN_COMMISSIONING_MINUTES
 DEFAULT_WATCHDOG_OBSERVE_SECONDS = 90
 DEFAULT_WATCHDOG_POLL_SECONDS = 5
@@ -566,6 +589,218 @@ class CommissioningSession:
         return self._record(CommissioningResult(
             operation=operation, ok=False, state=state,
             detail=f"release returned {result.value}"))
+
+    # --- the first experiment with real power in it ------------------------
+
+    def _validate_discharge(
+        self, operation: str, power_percent, min_soc_percent, state
+    ) -> Optional[CommissioningResult]:
+        """Refuse a discharge that is too large, or a battery too low for one."""
+        if isinstance(power_percent, bool) or not isinstance(power_percent, int):
+            return self._refuse(
+                operation,
+                f"power must be a whole percent, got {power_percent!r}")
+
+        if power_percent < 1:
+            return self._refuse(
+                operation,
+                f"a discharge of {power_percent}% is not an experiment: 0 is "
+                f"'suspend forced cycle' and negatives are applied by the "
+                f"backend, which signs the value itself. Ask for a positive "
+                f"percent")
+
+        if power_percent > MAX_COMMISSIONING_DISCHARGE_PERCENT:
+            return self._refuse(
+                operation,
+                f"{power_percent}% exceeds the supervised discharge maximum of "
+                f"{MAX_COMMISSIONING_DISCHARGE_PERCENT}%. The question this "
+                f"answers is the SIGN and the routing of the power, and "
+                f"neither gets clearer with more of it")
+
+        soc = None if state is None else state.soc_percent
+        if soc is None:
+            return self._refuse(
+                operation,
+                "SOC is unreadable, so there is no way to know the battery can "
+                "afford this. Refusing rather than discharging blind")
+
+        if soc < min_soc_percent:
+            return self._refuse(
+                operation,
+                f"SOC is {soc:.0f}%, below the {min_soc_percent:.0f}% floor "
+                f"this experiment requires. Discharging a battery that is "
+                f"already near its reserve is not a test of anything")
+
+        return None
+
+    def _discharge_verdict(self, baseline, samples, power_percent,
+                           effect_threshold_w: float,
+                           export_tolerance_w: float) -> str:
+        """Say what the telemetry showed, in the terms the experiment asked.
+
+        Deliberately semantic rather than numeric: nothing here knows the
+        inverter's rated power well enough to check watts against a percent,
+        and a first run that fails on an arithmetic tolerance would teach
+        nothing. The two questions are whether the battery moved toward
+        discharge, and whether anything went to the grid while 30200/30201
+        said it must not.
+        """
+        armed = [s for _t, s in samples if s is not None
+                 and s.battery_power_w is not None]
+        if not armed or baseline is None or baseline.battery_power_w is None:
+            return ("discharge INCONCLUSIVE: battery power could not be read "
+                    "before and during the session")
+
+        before = baseline.battery_power_w
+        during = sorted(s.battery_power_w for s in armed)[len(armed) // 2]
+        delta = during - before
+
+        exports = [s.grid_export_power_w for _t, s in samples
+                   if s is not None and s.grid_export_power_w is not None]
+        peak_export = max(exports) if exports else None
+
+        if delta <= -effect_threshold_w:
+            effect = (f"discharge OBSERVED: battery {before:.0f} W -> "
+                      f"{during:.0f} W (median), {delta:.0f} W more negative "
+                      f"at a requested -{power_percent}%")
+        elif delta >= effect_threshold_w:
+            effect = (f"discharge INVERTED: battery went {delta:+.0f} W, "
+                      f"toward CHARGING, at a requested -{power_percent}%. "
+                      f"The sign convention or the register meaning is not "
+                      f"what this project assumes")
+        else:
+            effect = (f"NO MATERIAL CHANGE: battery {before:.0f} W -> "
+                      f"{during:.0f} W ({delta:+.0f} W), inside the "
+                      f"{effect_threshold_w:.0f} W noise band. The command was "
+                      f"accepted and read back; nothing followed it")
+
+        if peak_export is None:
+            export = "; grid export was not readable"
+        elif peak_export <= export_tolerance_w:
+            export = f"; export stayed negligible (peak {peak_export:.0f} W)"
+        else:
+            export = (f"; but EXPORT REACHED {peak_export:.0f} W under 30200=1 "
+                      f"/ 30201=0. That is not a failure of the discharge "
+                      f"command — it means the export limit does not mean what "
+                      f"this project assumes. Do not raise the power until it "
+                      f"is understood")
+
+        return effect + export
+
+    def discharge_test(
+        self,
+        wait,
+        power_percent: int = DEFAULT_DISCHARGE_PERCENT,
+        duration_minutes: int = MIN_COMMISSIONING_MINUTES,
+        observe_seconds: int = DEFAULT_DISCHARGE_OBSERVE_SECONDS,
+        poll_seconds: int = 5,
+        min_soc_percent: float = DEFAULT_DISCHARGE_MIN_SOC,
+        effect_threshold_w: float = DEFAULT_DISCHARGE_EFFECT_W,
+        export_tolerance_w: float = DEFAULT_EXPORT_TOLERANCE_W,
+        release_timeout_seconds: int = DEFAULT_RELEASE_TIMEOUT_SECONDS,
+    ) -> CommissioningResult:
+        """Ask the battery to serve the house at a few percent, and watch.
+
+        The first operation here that moves real energy, and it is built to
+        answer one question: does a NEGATIVE 30409 discharge to the house
+        while an export limit of zero is in force? Everything else is held
+        still. 30405, 30410 and 30476 are not touched — 30405 in particular is
+        known not to describe local behaviour cleanly, and a first experiment
+        does not need a second unknown in it.
+
+        It runs inside the same lease and release lifecycle as every other
+        operation, from before 30100=1 is attempted. With no hardware timeout,
+        an energetic command outside that envelope would be a session nothing
+        could be relied on to end.
+        """
+        operation = "discharge_test"
+        self.observations = []
+
+        invalid = self._validate_duration(operation, duration_minutes)
+        if invalid is not None:
+            return invalid
+
+        state, refusal = self._preflight(operation)
+        if refusal is not None:
+            return refusal
+
+        invalid = self._validate_discharge(operation, power_percent,
+                                           min_soc_percent, state)
+        if invalid is not None:
+            return invalid
+
+        baseline = self._observe("before ARM", with_power=True)
+
+        command = InverterCommand(
+            action=ControlAction.DISCHARGE_TO_LOAD,
+            power_percent=int(power_percent),
+            duration_minutes=int(duration_minutes),
+            export_rate=0,
+            reason=f"commissioning: {operation}",
+        )
+        result = self.backend.send(command)
+
+        if result is SendResult.RATE_LIMITED:
+            return self._record(CommissioningResult(
+                operation=operation, ok=False, refused=True, state=state,
+                detail="deferred: a control register is still in its 30 s "
+                       "write cooldown. Nothing was applied; retry shortly"))
+
+        if result is not SendResult.CONFIRMED:
+            self._degrade(f"{operation} returned {result.value}")
+            return self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                f"the discharge command returned {result.value}",
+                steps_ok=False)
+
+        verified = self.backend.verify(command, self.backend.read_state())
+        if verified.unverifiable or not verified.matched:
+            self._degrade(
+                f"{operation} was accepted but could not be confirmed by "
+                f"read-back ({verified.detail})")
+            return self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                f"read-back did not confirm the command ({verified.detail}); "
+                f"nothing was observed",
+                steps_ok=False)
+
+        self._log(f"armed: {verified.actual} — watching for "
+                  f"{observe_seconds}s")
+
+        summary = "no discharge verdict"
+        steps_ok = False
+        samples = []
+        try:
+            elapsed = 0
+            samples.append((0, self._observe("t=0s", with_power=True)))
+            while elapsed < observe_seconds:
+                step = min(poll_seconds, observe_seconds - elapsed)
+                wait(step)
+                elapsed += step
+                samples.append(
+                    (elapsed, self._observe(f"t={elapsed}s", with_power=True)))
+
+            summary = self._discharge_verdict(
+                baseline, samples, power_percent, effect_threshold_w,
+                export_tolerance_w)
+            # The observation completing is what makes the run a success. What
+            # it observed is a finding either way, and a surprising finding is
+            # the most valuable outcome an experiment can have.
+            steps_ok = True
+            self.observations.append(summary)
+            self._log(summary,
+                      level="INFO" if "OBSERVED" in summary else "WARNING")
+        except BaseException as exc:   # noqa: BLE001 - KeyboardInterrupt too
+            summary = (f"ABORTED by {type(exc).__name__}: {exc}. The battery "
+                       f"is being taken off this command before this returns")
+            steps_ok = False
+            self._log(summary, level="ERROR")
+        finally:
+            result = self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                summary, steps_ok=steps_ok)
+
+        return result
 
     # --- recovery of a session a previous instance left behind -------------
 

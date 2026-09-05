@@ -36,6 +36,7 @@ from battery_optimizer_lib.control.upstream_vpp import (
     REG_AC_CHARGE_ENABLE,
     REG_CHARGE_CUTOFF_SOC,
     REG_CONTROL_AUTHORITY,
+    REG_DISCHARGE_CUTOFF_SOC,
     REG_EXPORT_LIMIT_ENABLE,
     REG_EXPORT_LIMIT_RATE,
     REG_PRIORITY_MODE,
@@ -47,9 +48,11 @@ from battery_optimizer_lib.control.upstream_vpp import (
     StepResult,
 )
 
+# Still forbidden after DISCHARGE_TO_LOAD was admitted for the supervised
+# discharge test. Each of these spends money in a direction nothing has yet
+# observed on this hardware: grid charge buys, and both of the others sell.
 FORBIDDEN_ACTIONS = [
     ControlAction.GRID_CHARGE,
-    ControlAction.DISCHARGE_TO_LOAD,
     ControlAction.DISCHARGE_TO_GRID,
     ControlAction.MAX_EXPORT,
 ]
@@ -205,11 +208,10 @@ def test_an_unrecognised_control_mode_still_falls_back_to_dry_run():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("register", [
-    REG_EXPORT_LIMIT_ENABLE,   # 30200
-    REG_EXPORT_LIMIT_RATE,     # 30201
     REG_AC_CHARGE_ENABLE,      # 30410
     REG_TOU_NUM_PERIODS,       # 30411
     REG_CHARGE_CUTOFF_SOC,     # 30404
+    REG_DISCHARGE_CUTOFF_SOC,  # 30405 — a discharge does NOT license this one
 ])
 def test_the_executor_refuses_registers_outside_the_allowlist(register):
     app = FakeApp()
@@ -225,6 +227,8 @@ def test_the_executor_refuses_registers_outside_the_allowlist(register):
 @pytest.mark.parametrize("register", [
     REG_CONTROL_AUTHORITY, REG_REMOTE_ENABLE, REG_REMOTE_DURATION,
     REG_REMOTE_POWER, REG_PRIORITY_MODE,
+    # The export limit: admitted because it can only take capability away.
+    REG_EXPORT_LIMIT_ENABLE, REG_EXPORT_LIMIT_RATE,
 ])
 def test_the_executor_permits_exactly_the_commissioning_registers(register):
     app = FakeApp()
@@ -256,9 +260,13 @@ def test_a_write_failure_is_a_failure():
 # Commissioning cannot invoke non-commissioning actions
 # ---------------------------------------------------------------------------
 
-def test_only_hold_and_passthrough_are_commissioning_actions():
+def test_commissioning_transmits_hold_passthrough_and_the_load_discharge_only():
+    """DISCHARGE_TO_LOAD was admitted for the first energetic experiment. The
+    three that buy or sell were not, and admitting one is not a precedent for
+    the others: each needs its own hardware evidence first."""
     assert COMMISSIONING_ACTIONS == {ControlAction.HOLD,
-                                     ControlAction.PASSTHROUGH}
+                                     ControlAction.PASSTHROUGH,
+                                     ControlAction.DISCHARGE_TO_LOAD}
 
 
 @pytest.mark.parametrize("action", FORBIDDEN_ACTIONS)
@@ -1476,3 +1484,198 @@ def test_the_watchdog_verdict_brackets_the_disarm_and_names_the_overshoot():
     assert "t=60s and t=65s" in verdict
     assert "+5s" in verdict
     assert "30100 dropped with it" in verdict
+
+
+# ---------------------------------------------------------------------------
+# The supervised discharge: the first operation with real power in it
+# ---------------------------------------------------------------------------
+
+def discharging(watts=-500.0, export=0.0, soc=80.0):
+    """Telemetry for a FakeApp: the sensors the verdict reads."""
+    return InverterState(battery_power_w=watts, grid_export_power_w=export,
+                         grid_import_power_w=0.0, soc_percent=soc)
+
+
+def make_metered(registers=None, battery_w=-500.0, export_w=0.0, soc=80.0):
+    """A backend whose power sensors actually report something.
+
+    `positive_is_charging` so the numbers in these tests are the numbers the
+    backend sees; the reference WIT's own polarity is the opposite, and is
+    normalized in the backend and covered by its own tests.
+    """
+    backend, app, session = make(
+        registers,
+        soc_sensor="sensor.soc",
+        battery_power_sensor="sensor.battery",
+        battery_power_direction="positive_is_charging",
+        grid_import_power_sensor="sensor.grid_import",
+        grid_export_power_sensor="sensor.grid_export",
+    )
+    readings = {"sensor.soc": soc, "sensor.battery": battery_w,
+                "sensor.grid_import": 0.0, "sensor.grid_export": export_w}
+    app.get_state = lambda entity: readings.get(entity)
+    return backend, app, session, readings
+
+
+def test_the_discharge_plan_writes_the_export_limit_and_nothing_else():
+    """30200=1 / 30201=0 constrain the experiment; 30405, 30410 and 30476 are
+    not part of it, and a discharge does not license them."""
+    backend, _app, _session = make(clean())
+
+    plan = backend.build_plan(InverterCommand(
+        action=ControlAction.DISCHARGE_TO_LOAD, power_percent=5,
+        duration_minutes=1, export_rate=0))
+
+    assert [(s.register, s.value) for s in plan.steps] == [
+        (REG_EXPORT_LIMIT_ENABLE, 1),
+        (REG_EXPORT_LIMIT_RATE, 0),
+        (REG_REMOTE_DURATION, 1),
+        (REG_REMOTE_POWER, -5),          # the sign is the whole experiment
+        (REG_CONTROL_AUTHORITY, 1),
+        (REG_REMOTE_ENABLE, 1),          # ARM last, as always
+    ]
+
+
+def test_the_discharge_setpoint_is_written_negative():
+    backend, app, session, _readings = make_metered(clean())
+
+    session.discharge_test(wait=make_waiter(backend, app), power_percent=5,
+                           duration_minutes=1, observe_seconds=10,
+                           poll_seconds=5)
+
+    assert (REG_REMOTE_POWER, -5) in app.writes
+
+
+@pytest.mark.parametrize("percent", [11, 50, 100])
+def test_a_supervised_discharge_is_bounded(percent):
+    backend, app, session, _readings = make_metered(clean())
+
+    result = session.discharge_test(wait=make_waiter(backend, app),
+                                    power_percent=percent, duration_minutes=1,
+                                    observe_seconds=10)
+
+    assert result.refused is True
+    assert "exceeds the supervised discharge maximum" in result.detail
+    assert app.writes == []
+
+
+def test_a_discharge_below_the_soc_floor_is_refused():
+    """A battery near its reserve is not a test of anything."""
+    backend, app, session, _readings = make_metered(clean(), soc=25.0)
+
+    result = session.discharge_test(wait=make_waiter(backend, app),
+                                    power_percent=5, duration_minutes=1,
+                                    observe_seconds=10, min_soc_percent=30.0)
+
+    assert result.refused is True
+    assert "below the 30% floor" in result.detail
+    assert app.writes == []
+
+
+def test_an_unreadable_soc_refuses_rather_than_discharging_blind():
+    backend, app, session, _readings = make_metered(clean(), soc=None)
+
+    result = session.discharge_test(wait=make_waiter(backend, app),
+                                    power_percent=5, duration_minutes=1,
+                                    observe_seconds=10)
+
+    assert result.refused is True
+    assert "SOC is unreadable" in result.detail
+    assert app.writes == []
+
+
+def test_the_discharge_obeys_the_external_scheduler_interlock():
+    backend, app, session, _readings = make_metered(external_scheduler(16))
+
+    result = session.discharge_test(wait=make_waiter(backend, app),
+                                    power_percent=5, duration_minutes=1,
+                                    observe_seconds=10)
+
+    assert result.refused is True
+    assert "EXTERNAL SCHEDULER" in result.detail
+    assert app.writes == []
+
+
+def test_the_discharge_always_hands_the_inverter_back():
+    backend, app, session, _readings = make_metered(clean())
+
+    session.discharge_test(wait=make_waiter(backend, app), power_percent=5,
+                           duration_minutes=1, observe_seconds=10,
+                           poll_seconds=5)
+
+    assert backend.session_state is SessionState.RELEASED
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+
+
+def test_an_interrupted_discharge_still_hands_the_inverter_back():
+    backend, app, session, _readings = make_metered(clean())
+    base = make_waiter(backend, app)
+    calls = {"n": 0}
+
+    def wait(seconds):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt()
+        base(seconds)
+
+    result = session.discharge_test(wait=wait, power_percent=5,
+                                    duration_minutes=1, observe_seconds=60)
+
+    assert result.ok is False
+    assert "ABORTED by KeyboardInterrupt" in result.detail
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+
+
+# --- the verdict ----------------------------------------------------------
+
+def verdict_for(before_w, during_w, export_w=0.0):
+    _backend, _app, session = make(clean())
+    samples = [(t, discharging(watts=during_w, export=export_w))
+               for t in (0, 5, 10)]
+    return session._discharge_verdict(
+        discharging(watts=before_w), samples, 5,
+        effect_threshold_w=150.0, export_tolerance_w=50.0)
+
+
+def test_a_battery_that_discharges_harder_is_the_result_we_wanted():
+    assert "discharge OBSERVED" in verdict_for(-500.0, -1100.0)
+
+
+def test_a_command_that_changed_nothing_is_said_plainly():
+    """Accepted, read back, and followed by nothing. That is a finding, and
+    dressing it up as a pass would be the worst outcome available."""
+    verdict = verdict_for(-500.0, -540.0)
+
+    assert "NO MATERIAL CHANGE" in verdict
+    assert "accepted and read back" in verdict
+
+
+def test_a_battery_that_charges_instead_says_the_sign_is_wrong():
+    assert "discharge INVERTED" in verdict_for(-500.0, +300.0)
+
+
+def test_export_under_a_zero_export_limit_is_reported_as_our_misunderstanding():
+    """Not a failure of the discharge command: the battery did what it was
+    asked. It means 30200/30201 do not mean what this project assumes."""
+    verdict = verdict_for(-500.0, -1100.0, export_w=800.0)
+
+    assert "discharge OBSERVED" in verdict
+    assert "EXPORT REACHED 800 W" in verdict
+    assert "Do not raise the power" in verdict
+
+
+def test_negligible_export_is_reported_as_negligible():
+    assert "export stayed negligible" in verdict_for(-500.0, -1100.0,
+                                                     export_w=12.0)
+
+
+def test_the_verdict_refuses_to_conclude_without_readings():
+    _backend, _app, session = make(clean())
+
+    verdict = session._discharge_verdict(
+        None, [(0, None)], 5, effect_threshold_w=150.0,
+        export_tolerance_w=50.0)
+
+    assert "discharge INCONCLUSIVE" in verdict

@@ -18,6 +18,9 @@ anywhere near it.
                   inverter end the session by itself? Polls 30100/30407/30408/
                   30409 and the measured battery and grid power every few
                   seconds, past the expiry, then releases.
+    discharge-test  ask the battery to serve the HOUSE at a few percent for
+                  ~60 s under a zero export limit, then release. The first
+                  operation here that moves real energy.
     recover       release a session a PREVIOUS run left armed, using the
                   durable lease as evidence that it is ours to clean up
     strand        deliberately abandon an armed +1% session, for testing
@@ -33,6 +36,17 @@ or released by the next one — that invocation would find 30100=1 it did not
 set and refuse, correctly, leaving an armed session that only a watchdog
 expiry could end. An operation that can only ever open a session it cannot
 close has no safe use, so it is not offered.
+
+`discharge-test` is the first operation with real power in it, and it answers
+one question: does a NEGATIVE 30409 discharge to the house while 30200=1 /
+30201=0 forbids selling? It writes 30200, 30201, 30408, 30409, 30100 and 30407
+and NOTHING else — not 30405 (which is known not to describe local behaviour
+cleanly), not 30410, not 30476. It refuses above
+10 %, refuses below a SOC floor, prints its whole write plan before asking for
+--confirm, and runs inside the same lease and release lifecycle as everything
+else. Run it while the house is drawing MORE than the requested power, so the
+battery can satisfy the request without the grid being involved; otherwise the
+run tests two things at once.
 
 `watchdog-test` is the experiment `session-test` cannot be: it never renews.
 Everything else here assumed a session left alone expires on its own, and
@@ -126,6 +140,9 @@ from battery_optimizer_lib.control import (                             # noqa: 
 )
 from battery_optimizer_lib.control.commissioning import (               # noqa: E402
     DEFAULT_COMMISSIONING_MINUTES,
+    DEFAULT_DISCHARGE_MIN_SOC,
+    DEFAULT_DISCHARGE_OBSERVE_SECONDS,
+    DEFAULT_DISCHARGE_PERCENT,
     DEFAULT_WATCHDOG_MINUTES,
     DEFAULT_WATCHDOG_OBSERVE_SECONDS,
     MAX_COMMISSIONING_MINUTES,
@@ -134,8 +151,8 @@ from battery_optimizer_lib.control.commissioning import (               # noqa: 
 
 # No "hold" and no "renew": see the module docstring. An operation that can
 # only open a session this process cannot close is not offered at all.
-WRITING_OPERATIONS = ("session-test", "watchdog-test", "recover", "strand",
-                      "probe", "release")
+WRITING_OPERATIONS = ("session-test", "watchdog-test", "discharge-test",
+                      "recover", "strand", "probe", "release")
 
 DEFAULT_LEASE_PATH = os.path.expanduser("~/.battery_optimizer_commission_lease.json")
 DEFAULT_HEARTBEAT_PATH = os.path.expanduser(
@@ -315,6 +332,35 @@ def wait_for_release(app, backend, timeout_seconds: int) -> bool:
     return confirmed
 
 
+def print_discharge_plan(backend, power_percent, duration_minutes,
+                        observe_seconds) -> None:
+    """Show the exact sequence before it is sent.
+
+    The operator confirming this should be able to see every register it will
+    touch, and satisfy themselves that 30405, 30410 and 30476 are not among
+    them.
+    """
+    from battery_optimizer_lib.control import ControlAction, InverterCommand
+
+    command = InverterCommand(
+        action=ControlAction.DISCHARGE_TO_LOAD,
+        power_percent=int(power_percent),
+        duration_minutes=int(duration_minutes),
+        export_rate=0,
+        reason="commissioning: discharge_test",
+    )
+    print(f"--- discharge-test: -{power_percent}% to the HOUSE for "
+          f"~{observe_seconds}s ---")
+    print("\nwrite plan (write-on-change: a register already at its target "
+          "is not rewritten):")
+    for line in backend.build_plan(command).describe():
+        print(f"    {line}")
+    print("\nNOT written: 30405 (discharge cutoff SOC), 30410 (AC charge), "
+          "30476 (priority mode), 30411 (TOU).")
+    print("Then the full release lifecycle: 30100=0, settle, 30407=0, both "
+          "confirmed by read-back.\n")
+
+
 def strand(app, session, backend, duration_minutes, acknowledged: bool,
            heartbeat_path: str = "") -> int:
     """Open a session and abandon it, the way a killed process would.
@@ -385,12 +431,21 @@ def main() -> int:
                              f"{DEFAULT_COMMISSIONING_MINUTES} min, and to "
                              f"{DEFAULT_WATCHDOG_MINUTES} for watchdog-test, "
                              f"which wants the shortest window it can get")
-    parser.add_argument("--observe-seconds", type=int,
-                        default=DEFAULT_WATCHDOG_OBSERVE_SECONDS,
-                        help="watchdog-test: how long to keep polling after "
-                             "the hold. Must outlast the window, or the test "
-                             "ends while the session is still legitimately "
-                             "armed and proves nothing")
+    parser.add_argument("--observe-seconds", type=int, default=None,
+                        help=f"how long to keep polling. Defaults to "
+                             f"{DEFAULT_WATCHDOG_OBSERVE_SECONDS}s for "
+                             f"watchdog-test (which must outlast the window, "
+                             f"or it ends while the session is still "
+                             f"legitimately armed and proves nothing) and "
+                             f"{DEFAULT_DISCHARGE_OBSERVE_SECONDS}s for "
+                             f"discharge-test")
+    parser.add_argument("--power-percent", type=int,
+                        default=DEFAULT_DISCHARGE_PERCENT,
+                        help="discharge-test: percent of rated power to ask "
+                             "the battery for. Written NEGATIVE by the "
+                             "backend; give it as a positive number")
+    parser.add_argument("--min-soc", type=float, default=DEFAULT_DISCHARGE_MIN_SOC,
+                        help="discharge-test: refuse below this SOC")
     parser.add_argument("--poll-seconds", type=int, default=5,
                         help="watchdog-test: seconds between observations")
     parser.add_argument("--confirm", action="store_true",
@@ -424,9 +479,16 @@ def main() -> int:
 
     duration_minutes = args.duration_minutes
     if duration_minutes is None:
-        duration_minutes = (DEFAULT_WATCHDOG_MINUTES
-                            if args.operation == "watchdog-test"
-                            else DEFAULT_COMMISSIONING_MINUTES)
+        duration_minutes = (
+            DEFAULT_WATCHDOG_MINUTES
+            if args.operation in ("watchdog-test", "discharge-test")
+            else DEFAULT_COMMISSIONING_MINUTES)
+
+    observe_seconds = args.observe_seconds
+    if observe_seconds is None:
+        observe_seconds = (DEFAULT_DISCHARGE_OBSERVE_SECONDS
+                           if args.operation == "discharge-test"
+                           else DEFAULT_WATCHDOG_OBSERVE_SECONDS)
 
     if args.operation in WRITING_OPERATIONS and not args.confirm:
         print(f"REFUSED: '{args.operation}' writes to the inverter. "
@@ -471,8 +533,20 @@ def main() -> int:
         result = session.watchdog_test(
             wait=make_wait(app),
             duration_minutes=duration_minutes,
-            observe_seconds=args.observe_seconds,
+            observe_seconds=observe_seconds,
             poll_seconds=args.poll_seconds,
+            release_timeout_seconds=args.release_timeout,
+        )
+    elif args.operation == "discharge-test":
+        print_discharge_plan(backend, args.power_percent, duration_minutes,
+                             observe_seconds)
+        result = session.discharge_test(
+            wait=make_wait(app),
+            power_percent=args.power_percent,
+            duration_minutes=duration_minutes,
+            observe_seconds=observe_seconds,
+            poll_seconds=args.poll_seconds,
+            min_soc_percent=args.min_soc,
             release_timeout_seconds=args.release_timeout,
         )
     elif args.operation == "recover":
