@@ -174,7 +174,12 @@ slot and transmits none of them; the only writes come from
 time by a person via `scripts/commission.py --confirm`. The operation to run
 first is **`session-test`**, which performs HOLD -> a timed renewal experiment
 -> RELEASE against one backend, one session and one process, and stays alive
-until the release confirms in both halves. That grouping is forced by the
+until the release confirms in both halves. **`watchdog-test`** is the second: it
+holds for the shortest window, never renews, and polls the control block and the
+measured power past the expiry — that is what established there is no expiry.
+**`recover`** releases a session a previous instance left armed, on the strength
+of the durable lease, and **`strand`** deliberately creates one so that path can
+be tested. That grouping is forced by the
 design: session ownership is process-local (it comes from this process's own
 write results, never from register values), so a one-operation-per-invocation
 CLI *cannot* renew or release a session an earlier invocation opened — the
@@ -187,10 +192,35 @@ is built from them, alongside release and the 30476 capability probe (which
 always restores what it changed). **HOLD and renew are confirmed by reading
 30100/30407/30409 back**; a write that did not raise is not an armed session,
 and an unverifiable one latches degraded rather than being reported as open.
-The watchdog window is validated before any write: 30408=0 is refused (that is
-a session with no watchdog, not one without a timeout) and the accepted range
-is 1-10 minutes, with the renewal delay required to fall after the 30 s write
-cooldown and inside the session it renews.
+The duration is validated before any write: 30408=0 is refused and the accepted
+range is 1-10 minutes, with the renewal delay required to fall after the 30 s
+write cooldown and inside the session it renews.
+
+**There is no hardware watchdog, and 30408 is not one.** `watchdog-test` armed
+30408=1, never renewed, and polled every 5 s: 30407 read 1 at t=90s — half again
+past the window — and only an explicit release ended the session (2026-09-05).
+30408 does not count down either; it echoes the last value written. Treat it as
+a duration field whose enforcement is absent on this firmware. Nothing but a
+release from the owning process, or a supervised recovery, has been observed to
+end a session, so **no duration bounds anything** and every session must be
+watched to its release.
+
+**That is what `control/lease.py` exists for.** A durable JSON lease is written
+BEFORE authority is taken and removed only once both halves of a release are
+confirmed, so a process that dies mid-session leaves evidence. A later run that
+finds a lease AND an armed inverter that matches it (same device, 30411 clear,
+30409 still holding the recorded setpoint) enters `RECOVERABLE_LEASE`, which
+grants exactly one permission: **release**. It never resumes the command, never
+re-arms, never promotes to `ACTIVE` — a file cannot say what a register means,
+only that a previous instance started something and has no record of finishing
+it. Without a lease, `30100=1` stays `AUTHORITY_HELD_NOT_OURS` and is left
+alone, unchanged. `--operation strand` (which arms and then `os._exit`s) and
+`--operation recover` prove that path against the real failure; both were run
+end to end on hardware on 2026-09-05.
+
+A recovering process also adopts the 30100 write timestamp from the lease: the
+inverter's 30 s cooldown does not reset because the process that stamped it
+died, and without that the release is refused repeatedly before it lands.
 
 **Cleanup after `session_test` obeys three rules.** It always runs (a
 `finally`, so a failure, an exception or a Ctrl-C all leave through it); it is
@@ -268,7 +298,13 @@ report our own half-released session as somebody else's.
    the interlock. **PASSTHROUGH and `release()` are exempt**: an interlock that
    could trap a session open would be worse than the hazard it guards.
 
-`30409 = 0` is *not* idle — it is "suspend forced cycle". **HOLD is +1%.**
+`30409 = 0` is *not* idle — it is "suspend forced cycle". **HOLD is +1%**, and
++1% is a literal small charge request rather than a neutral sentinel: measured
+on the reference WIT, battery discharge stopped and turned to ~100-150 W of
+charge while the house load moved to the grid (~390 W imported), reverting
+within seconds of the release. That is the wanted reserve behaviour — the
+battery stops serving the house — but it is bought by importing, so anything
+reasoning about cost must treat HOLD as a small purchase, not as nothing.
 `30474` is a mirror of the last *commanded* setpoint, NOT applied power, so it
 can never prove the inverter is doing anything.
 
@@ -294,8 +330,9 @@ can never prove the inverter is doing anything.
   `30407=0` runs on a timer this process owns: authority is already back with
   the inverter, but stopping now strands an arm nobody owns, so
   **`safe_to_stop` is False throughout it** and `reconcile()` may not demote it
-  (`UNFINISHED_STATES`). Override *timer expiry* is a different thing again and
-  must not be conflated with either.
+  (`UNFINISHED_STATES`). Override *timer expiry* was treated as a third thing
+  that must not be conflated with either; on this hardware it does not happen
+  at all, so nothing may be assumed to resolve on its own.
 - Each command carries power_percent, duration, export_rate, ac_charge_mode, and SOC cutoffs
 - AC charge mode auto-selects `pv_priority` vs `ac_priority` based on current PV
   power. This is INTENT only: register 30410 accepts 0 and 1 on the reference

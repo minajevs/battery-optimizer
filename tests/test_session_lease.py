@@ -349,3 +349,39 @@ def test_an_acquiring_lease_is_recoverable_too(tmp_path):
     assert result.ok is True
     assert app.registers[REG_CONTROL_AUTHORITY] == 0
     assert backend.lease.read() is None
+
+
+# ---------------------------------------------------------------------------
+# Cooldowns do not die with the process that stamped them
+# ---------------------------------------------------------------------------
+
+def test_recovery_adopts_the_cooldown_the_dead_process_stamped(tmp_path):
+    """Found on hardware: the recovering run revoked authority immediately,
+    was refused ten times by the inverter's 30 s window, and reported
+    "rate-limited for another 0s" because its own tracker was empty. The
+    window belongs to the inverter, not to the process that stamped it."""
+    crashed, _app, session = make(tmp_path, clean())
+    session.hold(duration_minutes=5)
+    stamped_at = crashed.cooldown.last_write(REG_CONTROL_AUTHORITY)
+    assert stamped_at is not None
+
+    backend, _app2, _restarted = make(tmp_path, armed())
+    backend.clock.now = stamped_at + 5      # 5 s into the previous cooldown
+    backend.reconcile()
+
+    remaining = backend.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY)
+    assert 20 < remaining <= 25, remaining
+
+
+def test_an_old_lease_does_not_invent_a_cooldown_that_has_expired(tmp_path):
+    """Waiting is only ever the safe direction, but not for a window that
+    passed long ago -- that would delay a release for no reason."""
+    crashed, _app, session = make(tmp_path, clean())
+    session.hold(duration_minutes=5)
+    stamped_at = crashed.cooldown.last_write(REG_CONTROL_AUTHORITY)
+
+    backend, _app2, _restarted = make(tmp_path, armed())
+    backend.clock.now = stamped_at + 600
+    backend.reconcile()
+
+    assert backend.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY) == 0

@@ -526,6 +526,23 @@ class CooldownTracker:
         if register in RATE_LIMITED_REGISTERS:
             self._last_write[register] = self._clock()
 
+    def last_write(self, register: int) -> Optional[float]:
+        """When this register was last written successfully, if it was."""
+        return self._last_write.get(register)
+
+    def adopt(self, register: int, written_at: float) -> None:
+        """Take on a cooldown another process stamped.
+
+        Only ever used by lease recovery, and only to make this process WAIT
+        longer than its own empty tracker would: the inverter's cooldown does
+        not reset because the process that stamped it died.
+        """
+        if register not in RATE_LIMITED_REGISTERS:
+            return
+        existing = self._last_write.get(register)
+        if existing is None or written_at > existing:
+            self._last_write[register] = written_at
+
     def seconds_remaining(self, register: int) -> float:
         if register not in RATE_LIMITED_REGISTERS:
             return 0.0
@@ -988,7 +1005,10 @@ class UpstreamVppBackend:
         result = self._execute_plan(plan)
 
         if result is SendResult.CONFIRMED and command.action.holds_session:
-            self._lease_record = self.lease.mark(self._lease_record, LEASE_ACTIVE)
+            self._lease_record = self.lease.mark(
+                self._lease_record, LEASE_ACTIVE,
+                authority_written_at=self.cooldown.last_write(
+                    REG_CONTROL_AUTHORITY))
 
         return result
 
@@ -1183,9 +1203,18 @@ class UpstreamVppBackend:
         if result is not StepResult.OK:
             self._counters["release_deferred"] += 1
             remaining = self.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY)
+            if remaining > 0:
+                why = (f"revoking authority is rate-limited for another "
+                       f"{remaining:.0f}s")
+            else:
+                # Our tracker says the window is clear, so the refusal came
+                # from the inverter itself -- most often a cooldown stamped by
+                # a write this process never made.
+                why = ("the write was refused although this process's own "
+                       "cooldown window is clear, so the refusal came from the "
+                       "inverter (check the Home Assistant log)")
             self._log(
-                f"release deferred — revoking authority is rate-limited for "
-                f"another {remaining:.0f}s. The inverter is NOT released yet; "
+                f"release deferred — {why}. The inverter is NOT released yet; "
                 f"do not stop AppDaemon until the health sensor reads RELEASED.",
                 level="WARNING",
             )
@@ -1500,6 +1529,14 @@ class UpstreamVppBackend:
                 f"one recorded. NOT adopted — establish what changed it",
                 level="ERROR")
             return
+
+        if record.authority_written_at is not None:
+            # The inverter's 30 s cooldown on 30100 does not reset because the
+            # process that stamped it died. Adopting the timestamp turns ten
+            # rejected writes into one wait -- and stops this process reporting
+            # "rate-limited for another 0s" while the inverter refuses.
+            self.cooldown.adopt(REG_CONTROL_AUTHORITY,
+                                record.authority_written_at)
 
         self.session_state = SessionState.RECOVERABLE_LEASE
         self._lease_record = record

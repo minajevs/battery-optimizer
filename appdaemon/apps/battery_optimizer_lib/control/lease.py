@@ -62,6 +62,12 @@ class LeaseRecord:
     duration_minutes: Optional[int] = None
     updated_at: float = 0.0
     pid: Optional[int] = None
+    # When the previous instance last wrote 30100, as a wall-clock timestamp.
+    # A recovering process has no memory of the write cooldowns another
+    # process stamped, so without this it revokes authority into a refusal it
+    # could have predicted -- observed on hardware as ten rejected writes
+    # before the 30 s window cleared.
+    authority_written_at: Optional[float] = None
 
     def describe(self) -> str:
         age = max(0, int(time.time() - self.started_at))
@@ -126,6 +132,7 @@ class SessionLease:
                 duration_minutes=data.get("duration_minutes"),
                 updated_at=float(data.get("updated_at", 0.0)),
                 pid=data.get("pid"),
+                authority_written_at=data.get("authority_written_at"),
             )
         except Exception as e:  # noqa: BLE001 - same reasoning
             self.last_error = str(e)
@@ -181,13 +188,16 @@ class SessionLease:
         self._log(f"opened: {record.describe()}")
         return record
 
-    def mark(self, record: Optional[LeaseRecord],
-             state: str) -> Optional[LeaseRecord]:
+    def mark(self, record: Optional[LeaseRecord], state: str,
+             authority_written_at: Optional[float] = None
+             ) -> Optional[LeaseRecord]:
         """Advance a lease's state (ACQUIRING -> ACTIVE -> RELEASING)."""
         if record is None:
             return None
-        updated = LeaseRecord(**{**asdict(record), "state": state,
-                                 "updated_at": self._clock()})
+        fields = {**asdict(record), "state": state, "updated_at": self._clock()}
+        if authority_written_at is not None:
+            fields["authority_written_at"] = authority_written_at
+        updated = LeaseRecord(**fields)
         if not self._write(updated):
             return record
         self._log(f"{state}: {updated.describe()}", level="DEBUG")
