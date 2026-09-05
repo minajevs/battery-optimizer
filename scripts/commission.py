@@ -14,6 +14,10 @@ anywhere near it.
 
     session-test  HOLD -> timed renewal experiment -> RELEASE, start to
                   finish in this one process. THE ONLY WAY TO OPEN A SESSION.
+    watchdog-test HOLD for one minute, then DO NOTHING and watch: does the
+                  inverter end the session by itself? Polls 30100/30407/30408/
+                  30409 and the measured battery and grid power every few
+                  seconds, past the expiry, then releases.
     release       give the inverter back to its own local logic
     probe         write 30476 to a different value, read it back, restore it
 
@@ -25,6 +29,14 @@ or released by the next one — that invocation would find 30100=1 it did not
 set and refuse, correctly, leaving an armed session that only a watchdog
 expiry could end. An operation that can only ever open a session it cannot
 close has no safe use, so it is not offered.
+
+`watchdog-test` is the experiment `session-test` cannot be: it never renews.
+Everything else here assumes a session left alone expires on its own -- that is
+why a bounded duration is the answer to "what if this process is killed?" --
+and nothing had observed that happen. The first session test also showed 30408
+does NOT count down (it read 5 before and after a 35 s session), so the
+register cannot answer the question and only the behaviour of 30407 can. Its
+telemetry answers a second open question for free: what +1 % does physically.
 
 `session-test` opens and closes the session in one process. It stays alive
 through the whole release: RELEASED requires BOTH halves confirmed by
@@ -85,13 +97,16 @@ from battery_optimizer_lib.control import (                             # noqa: 
     build_executor,
 )
 from battery_optimizer_lib.control.commissioning import (               # noqa: E402
+    DEFAULT_COMMISSIONING_MINUTES,
+    DEFAULT_WATCHDOG_MINUTES,
+    DEFAULT_WATCHDOG_OBSERVE_SECONDS,
     MAX_COMMISSIONING_MINUTES,
     MIN_COMMISSIONING_MINUTES,
 )
 
 # No "hold" and no "renew": see the module docstring. An operation that can
 # only open a session this process cannot close is not offered at all.
-WRITING_OPERATIONS = ("session-test", "probe", "release")
+WRITING_OPERATIONS = ("session-test", "watchdog-test", "probe", "release")
 
 
 class RestApp:
@@ -262,11 +277,22 @@ def main() -> int:
     parser.add_argument("--device-id", required=True)
     parser.add_argument("--operation", required=True,
                         choices=("state",) + WRITING_OPERATIONS)
-    parser.add_argument("--duration-minutes", type=int, default=5,
+    parser.add_argument("--duration-minutes", type=int, default=None,
                         help=f"watchdog window for the session "
                              f"({MIN_COMMISSIONING_MINUTES}-"
                              f"{MAX_COMMISSIONING_MINUTES} min; 0 is refused — "
-                             f"it is a session with no watchdog)")
+                             f"it is a session with no watchdog). Defaults to "
+                             f"{DEFAULT_COMMISSIONING_MINUTES} min, and to "
+                             f"{DEFAULT_WATCHDOG_MINUTES} for watchdog-test, "
+                             f"which wants the shortest window it can get")
+    parser.add_argument("--observe-seconds", type=int,
+                        default=DEFAULT_WATCHDOG_OBSERVE_SECONDS,
+                        help="watchdog-test: how long to keep polling after "
+                             "the hold. Must outlast the window, or the test "
+                             "ends while the session is still legitimately "
+                             "armed and proves nothing")
+    parser.add_argument("--poll-seconds", type=int, default=5,
+                        help="watchdog-test: seconds between observations")
     parser.add_argument("--confirm", action="store_true",
                         help="required for any operation that writes")
     parser.add_argument("--wait-for-release", type=int, default=120,
@@ -283,6 +309,12 @@ def main() -> int:
     parser.add_argument("--battery-power-direction",
                         default="negative_is_charging")
     args = parser.parse_args()
+
+    duration_minutes = args.duration_minutes
+    if duration_minutes is None:
+        duration_minutes = (DEFAULT_WATCHDOG_MINUTES
+                            if args.operation == "watchdog-test"
+                            else DEFAULT_COMMISSIONING_MINUTES)
 
     if args.operation in WRITING_OPERATIONS and not args.confirm:
         print(f"REFUSED: '{args.operation}' writes to the inverter. "
@@ -317,8 +349,16 @@ def main() -> int:
     if args.operation == "session-test":
         result = session.session_test(
             wait=make_wait(app),
-            duration_minutes=args.duration_minutes,
+            duration_minutes=duration_minutes,
             renew_after_seconds=args.renew_after_seconds,
+            release_timeout_seconds=args.release_timeout,
+        )
+    elif args.operation == "watchdog-test":
+        result = session.watchdog_test(
+            wait=make_wait(app),
+            duration_minutes=duration_minutes,
+            observe_seconds=args.observe_seconds,
+            poll_seconds=args.poll_seconds,
             release_timeout_seconds=args.release_timeout,
         )
     elif args.operation == "probe":
@@ -338,7 +378,8 @@ def main() -> int:
     print()
     print_state(backend)
 
-    if args.operation in ("release", "session-test") and args.wait_for_release:
+    if (args.operation in ("release", "session-test", "watchdog-test")
+            and args.wait_for_release):
         wait_for_release(app, backend, args.wait_for_release)
         print()
         print_state(backend)

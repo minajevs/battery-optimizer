@@ -1276,3 +1276,201 @@ def test_a_session_refuses_everything_on_a_non_commissioning_backend():
         assert result.refused is True
         assert "not in commissioning mode" in result.detail
     assert app.writes == []
+
+
+# ---------------------------------------------------------------------------
+# The watchdog test: the session nobody renews
+# ---------------------------------------------------------------------------
+
+def expiring_waiter(backend, app, window_seconds, clear_authority=True):
+    """A waiter whose inverter ends the session itself once the window passes.
+
+    The plain FakeApp never expires anything -- it only holds what was written
+    -- so proving the CONFIRMED branch needs hardware that behaves like a
+    watchdog. ``clear_authority`` covers both shapes the expiry could take:
+    30407 alone, or 30100 with it.
+    """
+    base = make_waiter(backend, app)
+    elapsed = {"seconds": 0}
+
+    def wait(seconds):
+        base(seconds)
+        elapsed["seconds"] += seconds
+        if elapsed["seconds"] >= window_seconds:
+            app.registers[REG_REMOTE_ENABLE] = 0
+            if clear_authority:
+                app.registers[REG_CONTROL_AUTHORITY] = 0
+    return wait
+
+
+def test_the_watchdog_test_never_renews_the_session_it_opened():
+    """The whole point. A renewal would measure the wrong thing entirely."""
+    backend, app, session = make(clean())
+
+    session.watchdog_test(wait=make_waiter(backend, app), duration_minutes=1,
+                          observe_seconds=90, poll_seconds=5)
+
+    assert [r.operation for r in session.history] == [
+        "timed_hold", "release", "watchdog_test"]
+    assert (REG_REMOTE_DURATION, 1) in app.writes
+    # One arm, and no second one: the duration register is written exactly
+    # once, by the hold.
+    assert [reg for reg, _v in app.writes].count(REG_REMOTE_DURATION) == 1
+
+
+def test_a_session_that_expires_on_its_own_is_the_watchdog_confirmed():
+    backend, app, session = make(clean())
+
+    result = session.watchdog_test(
+        wait=expiring_waiter(backend, app, window_seconds=60),
+        duration_minutes=1, observe_seconds=90, poll_seconds=5)
+
+    assert result.ok is True
+    assert "watchdog CONFIRMED" in result.detail
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+
+
+def test_a_session_that_never_expires_is_reported_as_unproven():
+    """The finding that would matter most, and the one this fake produces:
+    nothing ends the session but us."""
+    backend, app, session = make(clean())
+
+    result = session.watchdog_test(wait=make_waiter(backend, app),
+                                   duration_minutes=1, observe_seconds=90,
+                                   poll_seconds=5)
+
+    assert "watchdog DID NOT FIRE" in result.detail
+    # The observation completed, so the test itself did its job -- and the
+    # inverter is still handed back by us rather than left armed.
+    assert result.ok is True
+    assert backend.session_state is SessionState.RELEASED
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+
+
+def test_an_expiry_that_leaves_authority_set_is_still_released_by_us():
+    """1/0 after expiry is the VPP standby hazard, not a finished session."""
+    backend, app, session = make(clean())
+
+    result = session.watchdog_test(
+        wait=expiring_waiter(backend, app, window_seconds=60,
+                             clear_authority=False),
+        duration_minutes=1, observe_seconds=90, poll_seconds=5)
+
+    assert "watchdog CONFIRMED" in result.detail
+    assert (REG_CONTROL_AUTHORITY, 0) in app.writes
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+    assert backend.session_state is SessionState.RELEASED
+
+
+def test_the_observation_must_outlast_the_window_it_watches():
+    backend, app, session = make(clean())
+
+    result = session.watchdog_test(wait=make_waiter(backend, app),
+                                   duration_minutes=1, observe_seconds=60)
+
+    assert result.refused is True
+    assert "cannot see a 60s session expire" in result.detail
+    assert app.writes == []
+
+
+def test_the_watchdog_test_refuses_a_session_with_no_watchdog():
+    backend, app, session = make(clean())
+
+    result = session.watchdog_test(wait=make_waiter(backend, app),
+                                   duration_minutes=0, observe_seconds=90)
+
+    assert result.refused is True
+    assert "NO WATCHDOG" in result.detail
+    assert app.writes == []
+
+
+def test_the_watchdog_test_obeys_the_external_scheduler_interlock():
+    backend, app, session = make(external_scheduler(16))
+
+    result = session.watchdog_test(wait=make_waiter(backend, app),
+                                   duration_minutes=1, observe_seconds=90)
+
+    assert result.refused is True
+    assert "EXTERNAL SCHEDULER" in result.detail
+    assert app.writes == []
+
+
+def test_an_interrupted_watchdog_test_still_hands_the_inverter_back():
+    backend, app, session = make(clean())
+    base = make_waiter(backend, app)
+    calls = {"n": 0}
+
+    def wait(seconds):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt()
+        base(seconds)
+
+    result = session.watchdog_test(wait=wait, duration_minutes=1,
+                                   observe_seconds=90, poll_seconds=5)
+
+    assert result.ok is False
+    assert "ABORTED by KeyboardInterrupt" in result.detail
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+
+
+def test_every_observation_carries_the_measured_effect():
+    """The registers say what the inverter was told; only these say what it
+    did. Sampling them costs nothing while the test is waiting anyway, and it
+    is the only evidence of what +1% does physically."""
+    backend, app, session = make(clean())
+
+    session.watchdog_test(wait=make_waiter(backend, app), duration_minutes=1,
+                          observe_seconds=90, poll_seconds=45)
+
+    polled = [line for line in session.observations if line.startswith("t=")]
+    assert len(polled) == 3           # t=0, t=45, t=90
+    for line in polled:
+        assert "bat=" in line and "grid=" in line and "soc=" in line
+
+
+def test_unreadable_power_sensors_are_named_rather_than_reported_as_zero():
+    _backend, _app, session = make(clean())
+
+    described = session._describe_power(InverterState(battery_power_w=-410.0,
+                                                      grid_import_power_w=57.0))
+
+    assert "bat=-410W" in described
+    assert "grid=57/?" in described    # export unread, not 0
+    assert "soc=?" in described
+
+
+def test_the_watchdog_verdict_needs_an_armed_session_to_watch():
+    _backend, _app, session = make(clean())
+
+    verdict = session._watchdog_verdict(
+        [(0, InverterState(remote_enabled=0, control_authority=0)),
+         (5, InverterState(remote_enabled=0, control_authority=0))], 60)
+
+    assert "watchdog INCONCLUSIVE" in verdict
+    assert "never read 1" in verdict
+
+
+def test_the_watchdog_verdict_refuses_to_conclude_from_an_unreadable_inverter():
+    _backend, _app, session = make(clean())
+
+    verdict = session._watchdog_verdict([(0, None), (5, None)], 60)
+
+    assert "watchdog INCONCLUSIVE" in verdict
+
+
+def test_the_watchdog_verdict_brackets_the_disarm_and_names_the_overshoot():
+    _backend, _app, session = make(clean())
+
+    verdict = session._watchdog_verdict(
+        [(0, InverterState(remote_enabled=1, control_authority=1)),
+         (60, InverterState(remote_enabled=1, control_authority=1)),
+         (65, InverterState(remote_enabled=0, control_authority=0))], 60)
+
+    assert "watchdog CONFIRMED" in verdict
+    assert "t=60s and t=65s" in verdict
+    assert "+5s" in verdict
+    assert "30100 dropped with it" in verdict

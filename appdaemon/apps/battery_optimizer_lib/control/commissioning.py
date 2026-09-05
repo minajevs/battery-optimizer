@@ -34,6 +34,16 @@ same reason: an operation that can only open a session the next process
 cannot close has no safe use. They remain here because ``session_test`` is
 built from them.
 
+**``watchdog_test()`` is the second experiment**, and it asks the opposite
+question: left alone, does a session end by itself? It holds for the shortest
+window the inverter accepts, never renews, and polls the control block and the
+measured power until well past the expiry. The whole safety argument for a
+bounded session — "if this process dies, the override expires on its own" —
+rests on a watchdog that nothing had yet observed firing. It is a separate
+operation rather than a flag on ``session_test`` because that one re-arms on
+purpose, and an option that quietly suppressed the renewal would leave one
+function whose meaning depends on an argument.
+
 Three rules govern the cleanup, and they are the reason this is safe to run
 against real hardware:
 
@@ -105,6 +115,14 @@ MAX_COMMISSIONING_MINUTES = 10
 # The renewal experiment must re-arm AFTER the per-register write cooldown has
 # expired, or it measures the cooldown instead of the watchdog.
 DEFAULT_RENEW_AFTER_SECONDS = 35
+
+# The watchdog test asks the OPPOSITE question from the renewal experiment:
+# left alone, does the session end by itself? So it holds for the shortest
+# window the inverter accepts and then does nothing at all, and the observation
+# has to outlast the window or it cannot see the expiry it is looking for.
+DEFAULT_WATCHDOG_MINUTES = MIN_COMMISSIONING_MINUTES
+DEFAULT_WATCHDOG_OBSERVE_SECONDS = 90
+DEFAULT_WATCHDOG_POLL_SECONDS = 5
 
 # How long the session test will keep waiting for a release to reach RELEASED.
 # The lifecycle is two confirmed halves plus a settle, so this is minutes, not
@@ -518,8 +536,15 @@ class CommissioningSession:
 
     # --- the long-lived supervised session test ---------------------------
 
-    def _observe(self, label: str) -> Optional[InverterState]:
-        """Read and record the four session registers, for the operator."""
+    def _observe(self, label: str,
+                 with_power: bool = False) -> Optional[InverterState]:
+        """Read and record the four session registers, for the operator.
+
+        ``with_power`` appends the measured effect — battery power (normalized,
+        + = charging), the two directional grid readings and SOC. Registers say
+        what the inverter was TOLD; only these say what it did, which is the
+        second question the watchdog test answers for free while it waits.
+        """
         state = self.backend.read_state()
         if state is None:
             line = f"{label}: inverter UNREADABLE"
@@ -528,9 +553,24 @@ class CommissioningSession:
                     f"30407={state.remote_enabled} "
                     f"30408={state.duration_minutes} "
                     f"30409={state.commanded_power}")
+            if with_power:
+                line = f"{line} | {self._describe_power(state)}"
         self.observations.append(line)
         self._log(line)
         return state
+
+    @staticmethod
+    def _describe_power(state: InverterState) -> str:
+        """Measured effect, with unreadable sensors named rather than zeroed."""
+        def number(value, unit, sign=False):
+            if value is None:
+                return "?"
+            return f"{value:+.0f}{unit}" if sign else f"{value:.0f}{unit}"
+
+        return (f"bat={number(state.battery_power_w, 'W', sign=True)} "
+                f"grid={number(state.grid_import_power_w, '')}/"
+                f"{number(state.grid_export_power_w, 'W')} "
+                f"soc={number(state.soc_percent, '%')}")
 
     @staticmethod
     def _renewal_verdict(opened, elapsed, renewed, duration_minutes) -> str:
@@ -647,6 +687,170 @@ class CommissioningSession:
             result = self._release_and_report(
                 operation, wait, release_timeout_seconds, poll_seconds,
                 summary, steps_ok=steps_ok)
+
+        return result
+
+    # --- the watchdog test ------------------------------------------------
+
+    def _validate_observation_window(
+        self, operation: str, duration_minutes: int, observe_seconds
+    ) -> Optional[CommissioningResult]:
+        """Refuse an observation that stops before the expiry it is watching for."""
+        if not isinstance(observe_seconds, int) or isinstance(
+                observe_seconds, bool):
+            return self._refuse(
+                operation,
+                f"observation window must be a whole number of seconds, got "
+                f"{observe_seconds!r}")
+
+        window = duration_minutes * 60
+        if observe_seconds <= window:
+            return self._refuse(
+                operation,
+                f"observing for {observe_seconds}s cannot see a {window}s "
+                f"session expire: the test would end while the session is "
+                f"still legitimately armed and prove nothing either way")
+
+        return None
+
+    @staticmethod
+    def _watchdog_verdict(samples, window_seconds: int) -> str:
+        """What the polled 30407 readings establish about the watchdog.
+
+        Only the DISARM matters. 30408 was already shown to echo the last
+        written value rather than count down, so the question is no longer what
+        the register says but whether the inverter ends the session on its own.
+        """
+        readable = [(t, s) for t, s in samples if s is not None]
+        if not readable:
+            return ("watchdog INCONCLUSIVE: the inverter was unreadable for "
+                    "the whole observation")
+
+        armed = [(t, s) for t, s in readable if s.remote_enabled == 1]
+        if not armed:
+            return ("watchdog INCONCLUSIVE: 30407 never read 1 after the hold, "
+                    "so no armed session was observed to expire")
+
+        dropped = next((t for t, s in readable if t > armed[0][0]
+                        and s.remote_enabled == 0), None)
+        last_t = readable[-1][0]
+
+        if dropped is None:
+            return (f"watchdog DID NOT FIRE: 30407 was still 1 at t={last_t}s "
+                    f"with a {window_seconds}s window. The session does NOT "
+                    f"self-expire, so a process that dies holding one leaves "
+                    f"the inverter armed until something clears it by hand — "
+                    f"treat the watchdog as unproven and keep every session "
+                    f"attended")
+
+        state_at_drop = next(s for t, s in readable if t == dropped)
+        authority = ("and 30100 dropped with it"
+                     if state_at_drop.control_authority == 0
+                     else f"while 30100 stayed at "
+                          f"{state_at_drop.control_authority}")
+        overshoot = dropped - window_seconds
+        return (f"watchdog CONFIRMED: 30407 cleared itself between "
+                f"t={dropped - DEFAULT_WATCHDOG_POLL_SECONDS}s and t={dropped}s "
+                f"({overshoot:+d}s against the {window_seconds}s window), "
+                f"{authority}")
+
+    def watchdog_test(
+        self,
+        wait,
+        duration_minutes: int = DEFAULT_WATCHDOG_MINUTES,
+        observe_seconds: int = DEFAULT_WATCHDOG_OBSERVE_SECONDS,
+        poll_seconds: int = DEFAULT_WATCHDOG_POLL_SECONDS,
+        release_timeout_seconds: int = DEFAULT_RELEASE_TIMEOUT_SECONDS,
+    ) -> CommissioningResult:
+        """HOLD for the shortest window -> DO NOT renew -> watch it expire.
+
+        The session test proved the lifecycle works while a process drives it.
+        This asks what happens when nothing does: the whole safety argument for
+        a bounded session — "if this process dies, the override expires by
+        itself" — rests on a watchdog nothing has yet observed firing.
+
+        Deliberately NOT a mode of ``session_test``. That operation re-arms on
+        purpose; this one must not, and an option that silently suppressed the
+        renewal would make the two experiments one function whose meaning
+        depends on a flag.
+
+        A release is still issued at the end, whatever the registers say. If
+        the watchdog fired, it costs one refused write and confirms 0/0 by
+        read-back; if it did not, that release is the only thing that ends the
+        session — which is exactly the case this test exists to find.
+        """
+        operation = "watchdog_test"
+        self.observations = []
+
+        invalid = self._validate_duration(operation, duration_minutes)
+        if invalid is not None:
+            return invalid
+        invalid = self._validate_observation_window(
+            operation, duration_minutes, observe_seconds)
+        if invalid is not None:
+            return invalid
+
+        opened = self.hold(duration_minutes=duration_minutes)
+        if opened.refused:
+            return self._record(CommissioningResult(
+                operation=operation, ok=False, refused=True,
+                detail=f"refused before opening a session: {opened.detail}"))
+
+        if not opened.ok:
+            return self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                f"HOLD did not confirm ({opened.detail}); nothing was left "
+                f"running to observe",
+                steps_ok=False)
+
+        window_seconds = duration_minutes * 60
+        summary = "no watchdog verdict"
+        steps_ok = False
+        try:
+            samples = [(0, self._observe("t=0s", with_power=True))]
+            elapsed = 0
+            while elapsed < observe_seconds:
+                step = min(poll_seconds, observe_seconds - elapsed)
+                wait(step)
+                elapsed += step
+                samples.append(
+                    (elapsed, self._observe(f"t={elapsed}s", with_power=True)))
+
+            summary = self._watchdog_verdict(samples, window_seconds)
+            # The verdict is about the inverter, not about the run: an
+            # observation that completed has done its job even when what it
+            # observed is that the watchdog never fired.
+            steps_ok = True
+            self.observations.append(summary)
+            self._log(summary,
+                      level="INFO" if "CONFIRMED" in summary else "WARNING")
+        except BaseException as exc:   # noqa: BLE001 - KeyboardInterrupt too
+            summary = (f"ABORTED by {type(exc).__name__}: {exc}. A session was "
+                       f"open, so it is being handed back before this returns")
+            steps_ok = False
+            self._log(summary, level="ERROR")
+        finally:
+            result = self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                summary, steps_ok=steps_ok)
+
+        # A watchdog that fired has already handed the inverter back, so the
+        # release finds nothing of this process's to revoke and the session
+        # ends at NOT_ARMED rather than RELEASED. For every other operation
+        # that is a failure worth reporting; here it is precisely the result
+        # being looked for -- but only once the registers say 0/0, because
+        # "nothing to revoke" must never be inferred from the absence of a
+        # release rather than from the state of the inverter.
+        if not result.ok and "watchdog CONFIRMED" in summary:
+            final = self.backend.read_state()
+            if (final is not None and final.control_authority == 0
+                    and final.remote_enabled == 0):
+                result = self._record(CommissioningResult(
+                    operation=operation, ok=True, state=final,
+                    detail=f"{summary}; the inverter had already returned "
+                           f"itself to 0/0, so the release found nothing of "
+                           f"this process's left to revoke — confirmed by "
+                           f"read-back"))
 
         return result
 

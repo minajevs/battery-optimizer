@@ -14,6 +14,8 @@ from .commissioning import (
     CommissioningResult,
     CommissioningSession,
     DEFAULT_COMMISSIONING_MINUTES,
+    DEFAULT_WATCHDOG_MINUTES,
+    DEFAULT_WATCHDOG_OBSERVE_SECONDS,
 )
 from .upstream_vpp import (
     COMMISSIONING_ACTIONS,
@@ -48,6 +50,8 @@ __all__ = [
     "CommissioningResult",
     "CommissioningSession",
     "DEFAULT_COMMISSIONING_MINUTES",
+    "DEFAULT_WATCHDOG_MINUTES",
+    "DEFAULT_WATCHDOG_OBSERVE_SECONDS",
     "DryRunExecutor",
     "HaCommissioningExecutor",
     "HaReadOnlyExecutor",
