@@ -97,12 +97,21 @@ WRITING_OPERATIONS = ("session-test", "probe", "release")
 class RestApp:
     """The slice of the AppDaemon API the backend uses, over HA's REST API."""
 
+    # Services that HA registers with SupportsResponse.NONE reject a call
+    # carrying ?return_response with a 400 BEFORE the handler runs, so asking
+    # for a response indiscriminately makes every write fail without ever
+    # reaching the inverter. Which services return one is discovered from HA
+    # itself; this set is only the fallback if that discovery fails, and it
+    # holds the one read the backend cannot work without.
+    FALLBACK_RESPONSE_SERVICES = frozenset({"growatt_modbus/get_register_data"})
+
     def __init__(self, base: str, token: str, verbose: bool = False):
         self.base = base.rstrip("/")
         self.token = token
         self.verbose = verbose
         self.pending = []          # (callback, due_timestamp, handle)
         self._handle = 0
+        self._response_services = None   # discovered lazily, once
 
     def _request(self, path: str, payload=None):
         data = json.dumps(payload).encode() if payload is not None else None
@@ -126,15 +135,50 @@ class RestApp:
         except Exception:
             return None
 
+    def _returns_response(self, service: str) -> bool:
+        """Does this service declare a response? Asked of HA, once."""
+        if self._response_services is None:
+            try:
+                domains = self._request("/api/services")
+                self._response_services = {
+                    f"{domain['domain']}/{name}"
+                    for domain in domains
+                    for name, spec in domain.get("services", {}).items()
+                    if spec.get("response")
+                }
+            except Exception as e:  # noqa: BLE001 - discovery is best-effort
+                self.log(f"service discovery failed ({e}); falling back to "
+                         f"{sorted(self.FALLBACK_RESPONSE_SERVICES)}",
+                         level="WARNING")
+                self._response_services = set(self.FALLBACK_RESPONSE_SERVICES)
+        return service in self._response_services
+
     def call_service(self, service, hass_timeout=None, **kwargs):
+        path = f"/api/services/{service}"
+        if self._returns_response(service):
+            path += "?return_response"
         try:
-            data = self._request(f"/api/services/{service}?return_response", kwargs)
+            data = self._request(path, kwargs)
         except urllib.error.HTTPError as e:
-            # HA turns a service exception into a 400 whose body carries the
-            # message -- including the WIT cooldown refusal, which the executor
-            # maps to RATE_LIMITED by matching on that text.
+            # A ServiceValidationError reaches us as a 400 whose body carries
+            # the message. A plain ValueError -- which is what
+            # growatt_modbus.write_register raises, including for the WIT write
+            # cooldown -- becomes a 500 with a generic body, so that text does
+            # NOT survive the REST hop and the executor cannot map it to
+            # RATE_LIMITED. The backend's own cooldown tracker is what keeps
+            # that case from being reported as a hard failure; a 500 here means
+            # the real reason is in the HA log, not in this message.
             detail = e.read().decode(errors="replace")
+            if e.code >= 500:
+                detail += (" (HA hides service exception messages on 5xx -- "
+                           "check the Home Assistant log for the real cause)")
             raise RuntimeError(f"HTTP {e.code}: {detail}") from None
+        if not isinstance(data, dict):
+            # Without ?return_response HA answers with the LIST of states the
+            # call changed -- often empty. There is no service response to
+            # unwrap, and the write path ignores the value anyway; what matters
+            # is that a successful write is not turned into an exception here.
+            return data
         return data.get("service_response", data)
 
     def run_in(self, callback, delay, **kwargs):
