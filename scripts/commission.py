@@ -31,12 +31,17 @@ expiry could end. An operation that can only ever open a session it cannot
 close has no safe use, so it is not offered.
 
 `watchdog-test` is the experiment `session-test` cannot be: it never renews.
-Everything else here assumes a session left alone expires on its own -- that is
-why a bounded duration is the answer to "what if this process is killed?" --
-and nothing had observed that happen. The first session test also showed 30408
-does NOT count down (it read 5 before and after a 35 s session), so the
-register cannot answer the question and only the behaviour of 30407 can. Its
-telemetry answers a second open question for free: what +1 % does physically.
+Everything else here assumed a session left alone expires on its own, and
+nothing had observed that happen. It does not: on 2026-09-05 the reference WIT
+held 30407=1 through t=90s of a 60 s window, and only the release ended the
+session. 30408 does not count down either -- it echoes the last value written
+-- so neither register describes a timeout, and re-running this is how any
+firmware change to that would be noticed.
+
+Its telemetry answered the other open question the same run. At +1 % the
+battery stopped serving the house: discharge fell from ~460 W to ~110 W and
+~390 W came from the grid instead, reverting within seconds of the release. So
+HOLD does hold, and it holds by importing.
 
 `session-test` opens and closes the session in one process. It stays alive
 through the whole release: RELEASED requires BOTH halves confirmed by
@@ -47,9 +52,14 @@ exist only while this process does.
 back; the process stays alive through that cleanup. A second Ctrl-C during
 cleanup force-aborts and may leave the inverter armed — it says so, loudly,
 and `--operation state` is how you check. A reporting timeout marks the test
-failed but never ends the cleanup on its own. If the process is killed
-outright, the timed override expires by itself and the inverter returns to
-its base mode; that is what the bounded 1-10 minute duration is for.
+failed but never ends the cleanup on its own.
+
+**If the process is killed outright, nothing rescues the inverter.** The
+timed override was expected to expire by itself; `watchdog-test` established
+on 2026-09-05 that it does not (30407 still 1 at t=90s after a 60 s window).
+The bounded 1-10 minute duration is therefore a bound on the operator's
+attention, not a safety net. `--operation release` and `--operation state` are
+what end and check a stranded session.
 
 `release` remains for the aftermath of exactly that: it refuses to revoke
 authority this process did not take, so it is a safe thing to try and a

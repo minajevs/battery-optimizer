@@ -156,9 +156,15 @@ class SessionState(enum.Enum):
     ``RELEASED`` is reserved for a session whose BOTH halves were confirmed by
     read-back: 30100 == 0 and 30407 == 0. An unreadable inverter is never
     confirmation -- ``read_state() is None`` means "not known to be released",
-    which is the opposite of success. Timer expiry of the override is a
-    different thing again and must not be conflated with either: the watchdog
-    returns the inverter to its base mode, it does not clean up authority.
+    which is the opposite of success.
+
+    Timer expiry of the override was treated as a third thing that must not be
+    conflated with either -- the watchdog returning the inverter to its base
+    mode without cleaning up authority. On the reference WIT it does not happen
+    at all: a session left un-renewed held 30407=1 through t=90s of a 60 s
+    window (2026-09-05). Nothing but an explicit release has been observed to
+    end a session, so none of these states may be assumed to resolve on their
+    own.
     """
 
     NOT_ARMED = "not_armed"      # never taken authority in this process

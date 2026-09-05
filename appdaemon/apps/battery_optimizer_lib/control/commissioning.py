@@ -37,12 +37,18 @@ built from them.
 **``watchdog_test()`` is the second experiment**, and it asks the opposite
 question: left alone, does a session end by itself? It holds for the shortest
 window the inverter accepts, never renews, and polls the control block and the
-measured power until well past the expiry. The whole safety argument for a
-bounded session — "if this process dies, the override expires on its own" —
-rests on a watchdog that nothing had yet observed firing. It is a separate
-operation rather than a flag on ``session_test`` because that one re-arms on
-purpose, and an option that quietly suppressed the renewal would leave one
-function whose meaning depends on an argument.
+measured power until well past the expiry. It is a separate operation rather
+than a flag on ``session_test`` because that one re-arms on purpose, and an
+option that quietly suppressed the renewal would leave one function whose
+meaning depends on an argument.
+
+**It has been run, and the answer is no.** On the reference WIT (2026-09-05)
+30407 was still 1 at t=90s after a 60 s window. The safety argument every
+bounded session rested on — "if this process dies, the override expires on its
+own" — is false on this hardware, so an abandoned session stays armed until
+something clears it by hand. Until that is understood, every operation here
+must be watched to its release, and that release is the only thing known to
+end a session.
 
 Three rules govern the cleanup, and they are the reason this is safe to run
 against real hardware:
@@ -96,19 +102,30 @@ from .actions import ControlAction
 from .backend import InverterCommand, InverterState, SendResult
 from .upstream_vpp import HOLD_POWER_PERCENT, SessionState, UNFINISHED_STATES
 
-# Short by design. A commissioning HOLD should expire on its own well inside
-# the operator's attention span, so a forgotten session self-heals via the
-# inverter's watchdog rather than persisting.
+# Short by design: a commissioning HOLD should not outlive the operator's
+# attention span.
+#
+# It was ALSO believed that a forgotten session self-heals when the window
+# passes. It does not. See THE WATCHDOG DOES NOT FIRE below.
 DEFAULT_COMMISSIONING_MINUTES = 5
 
-# 30408 is the watchdog window, and it is the only thing that returns the
-# inverter to its base mode if this process dies mid-session. Both ends are
-# enforced, not advisory:
+# **THE WATCHDOG DOES NOT FIRE (reference WIT, 2026-09-05).** A session armed
+# with 30408=1 was left un-renewed and polled every 5 s: 30407 was still 1 at
+# t=90s, half again past the window, and only an explicit release ended it.
+# 30408 does not count down either -- it echoes the last value written. So on
+# THIS hardware, nothing has been observed to end a session except a release
+# from the process that opened it, and every claim in this project that a dying
+# process is caught by an expiry is unproven.
 #
-#   0 is NOT "no timeout" -- it is a session with no watchdog at all, exactly
-#     the state a supervised operation must never be able to create.
-#   10 minutes is the upper bound because a commissioning session should
-#     expire well inside the operator's attention span.
+# The bounds below are kept anyway, and both ends are enforced rather than
+# advisory:
+#
+#   0 is refused because a zero window cannot be a shorter fallback than a
+#     non-zero one, and writing it would assert a timeout semantic the
+#     hardware has not demonstrated.
+#   10 minutes is the upper bound because a commissioning session should not
+#     outlast the operator watching it -- which, with no working expiry, is
+#     now the ONLY thing that ends one.
 MIN_COMMISSIONING_MINUTES = 1
 MAX_COMMISSIONING_MINUTES = 10
 
@@ -625,9 +642,10 @@ class CommissioningSession:
         sleeps on its own.
 
         The inverter is handed back on every path out of here, including the
-        failing ones. If this process dies mid-test the watchdog expiry
-        returns the inverter to its base mode on its own, which is why the
-        hold is minutes long.
+        failing ones. That is not a nicety: the watchdog was expected to catch
+        a process that dies mid-test, and on the reference WIT it does not
+        fire at all (see THE WATCHDOG DOES NOT FIRE above). The release in the
+        ``finally`` is the only thing known to end a session.
         """
         operation = "session_test"
         self.observations = []
