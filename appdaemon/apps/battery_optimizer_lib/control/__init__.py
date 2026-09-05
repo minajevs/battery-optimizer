@@ -17,7 +17,9 @@ from .commissioning import (
     DEFAULT_WATCHDOG_MINUTES,
     DEFAULT_WATCHDOG_OBSERVE_SECONDS,
 )
+from .heartbeat import Heartbeat
 from .lease import LeaseRecord, SessionLease
+from .reaper import ReapVerdict, SessionReaper, assess as assess_stranded_session
 from .upstream_vpp import (
     COMMISSIONING_ACTIONS,
     CommandPlan,
@@ -54,8 +56,12 @@ __all__ = [
     "DEFAULT_WATCHDOG_MINUTES",
     "DEFAULT_WATCHDOG_OBSERVE_SECONDS",
     "DryRunExecutor",
+    "Heartbeat",
     "LeaseRecord",
+    "ReapVerdict",
     "SessionLease",
+    "SessionReaper",
+    "assess_stranded_session",
     "HaCommissioningExecutor",
     "HaReadOnlyExecutor",
     "build_executor",

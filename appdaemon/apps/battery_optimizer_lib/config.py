@@ -136,6 +136,12 @@ class BatteryOptimizerConfig:
     # control/lease.py). Empty disables persistence, which means a crash mid-
     # session strands the inverter until someone notices by hand.
     session_lease_path: str = ""
+    # Where this app stamps proof that it is still running. The reaper
+    # (appdaemon/apps/session_reaper.py) watches it go stale; a session whose
+    # owner has stopped running is one nothing else will ever end. Empty
+    # disables the stamp, which disables the reaper with it.
+    heartbeat_path: str = ""
+    heartbeat_seconds: int = 30
     # "auto" = use register 30476 only if a supervised probe confirmed it is
     # genuinely writable; "never" = never write it.
     priority_mode_write: str = "auto"
@@ -499,6 +505,8 @@ class BatteryOptimizerConfig:
             wit_cooldown_seconds=int(args.get("wit_cooldown_seconds", 30)),
             release_settle_seconds=int(args.get("release_settle_seconds", 35)),
             session_lease_path=args.get("session_lease_path", ""),
+            heartbeat_path=args.get("heartbeat_path", ""),
+            heartbeat_seconds=int(args.get("heartbeat_seconds", 30)),
             priority_mode_write=args.get("priority_mode_write", "auto"),
             control_mode=args.get("control_mode", "dry_run"),
             use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),

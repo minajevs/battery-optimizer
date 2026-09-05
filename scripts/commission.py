@@ -118,6 +118,7 @@ sys.path.insert(0, "appdaemon/apps")
 from battery_optimizer_lib.config import BatteryOptimizerConfig          # noqa: E402
 from battery_optimizer_lib.control import (                             # noqa: E402
     CommissioningSession,
+    Heartbeat,
     SessionLease,
     SessionState,
     UpstreamVppBackend,
@@ -137,6 +138,8 @@ WRITING_OPERATIONS = ("session-test", "watchdog-test", "recover", "strand",
                       "probe", "release")
 
 DEFAULT_LEASE_PATH = os.path.expanduser("~/.battery_optimizer_commission_lease.json")
+DEFAULT_HEARTBEAT_PATH = os.path.expanduser(
+    "~/.battery_optimizer_commission_heartbeat.json")
 
 
 class RestApp:
@@ -312,7 +315,8 @@ def wait_for_release(app, backend, timeout_seconds: int) -> bool:
     return confirmed
 
 
-def strand(app, session, backend, duration_minutes, acknowledged: bool) -> int:
+def strand(app, session, backend, duration_minutes, acknowledged: bool,
+           heartbeat_path: str = "") -> int:
     """Open a session and abandon it, the way a killed process would.
 
     The only operation here that deliberately leaves an inverter armed, and it
@@ -333,6 +337,13 @@ def strand(app, session, backend, duration_minutes, acknowledged: bool) -> int:
               "are about to run --operation recover.")
         return 2
 
+    # Stamp the heartbeat the way a living owner would, once. Abandoning it
+    # here is what makes this a faithful test of the reaper: the stamp goes
+    # stale on its own, exactly as it would for an optimizer that stopped
+    # running, rather than being deleted to force the verdict.
+    heartbeat = Heartbeat(heartbeat_path, log_func=app.log)
+    heartbeat.stamp()
+
     result = session.hold(duration_minutes=duration_minutes)
     print()
     print(result.describe())
@@ -347,9 +358,12 @@ def strand(app, session, backend, duration_minutes, acknowledged: bool) -> int:
 
     print_state(backend)
     print_lease(backend)
-    print("\nABANDONING THIS PROCESS NOW — the inverter stays armed, exactly "
+    print(f"\nheartbeat stamped at {heartbeat_path} and now abandoned; it "
+          f"goes stale on its own")
+    print("ABANDONING THIS PROCESS NOW — the inverter stays armed, exactly "
           "as it would after a crash.")
     print("Recover it with:  --operation recover --confirm")
+    print("or let the reaper find it:  scripts/reap.py --confirm")
     sys.stdout.flush()
     # Not sys.exit: that unwinds, and an orderly unwind is the one thing this
     # operation must not do.
@@ -395,6 +409,10 @@ def main() -> int:
                         help="durable record of an unfinished session. It is "
                              "the only thing that lets a later run recognise "
                              "a stranded session as ours to release")
+    parser.add_argument("--heartbeat-path", default=DEFAULT_HEARTBEAT_PATH,
+                        help="strand: where to stamp the heartbeat that the "
+                             "reaper watches go stale. Stamped once, then "
+                             "abandoned with the session")
     parser.add_argument("--strand-i-will-recover", action="store_true",
                         help="strand: acknowledge that this LEAVES THE "
                              "INVERTER ARMED and that you will run "
@@ -462,7 +480,8 @@ def main() -> int:
                                  release_timeout_seconds=args.release_timeout)
     elif args.operation == "strand":
         return strand(app, session, backend, duration_minutes,
-                      acknowledged=args.strand_i_will_recover)
+                      acknowledged=args.strand_i_will_recover,
+                      heartbeat_path=args.heartbeat_path)
     elif args.operation == "probe":
         result = session.probe_priority_mode()
     else:

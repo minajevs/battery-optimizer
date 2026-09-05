@@ -71,7 +71,11 @@ from battery_optimizer_lib import (
     AmbientTemperatureService,
     AmbientServiceConfig,
 )
-from battery_optimizer_lib.control import UpstreamVppBackend, build_executor
+from battery_optimizer_lib.control import (
+    Heartbeat,
+    UpstreamVppBackend,
+    build_executor,
+)
 from battery_optimizer_lib.direct_control import ApplyOutcome
 from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
 from battery_optimizer_lib.pv_profile import PvProfile
@@ -370,6 +374,26 @@ class BatteryOptimizer(hass.Hass):
             self.datetime() + datetime.timedelta(seconds=20),
             self.config.slot_minutes * 60,
         )
+
+        # Proof this app is still running, for the reaper that ends sessions
+        # whose owner stopped. Stamped on a TIMER rather than from the slot
+        # callbacks on purpose: a heartbeat that only ticks when work happens
+        # cannot distinguish "idle" from "wedged", and wedged is the case the
+        # reaper exists for.
+        self._heartbeat = Heartbeat(self.config.heartbeat_path,
+                                    log_func=self.log)
+        if self._heartbeat.enabled:
+            self._heartbeat.stamp()
+            self.run_every(
+                self._stamp_heartbeat,
+                self.datetime() + datetime.timedelta(seconds=5),
+                self.config.heartbeat_seconds,
+            )
+        else:
+            self.log("no heartbeat_path configured: nothing outside this app "
+                     "can tell whether it is still running, so a session left "
+                     "armed by a crash would not be reaped until a restart.",
+                     level="WARNING")
 
         # Record load observations (can be more frequent than schedule slots)
         self.run_every(
@@ -1276,6 +1300,11 @@ class BatteryOptimizer(hass.Hass):
         into 0 W — a missing reading must not be recorded as "no production".
         """
         return self._sensors.get_float(self.config.pv_power_sensor)
+
+    @_timed_callback
+    def _stamp_heartbeat(self, kwargs=None):
+        """Say "still alive" for the reaper. Never raises into AppDaemon."""
+        self._heartbeat.stamp()
 
     @_timed_callback
     def _sample_pv(self, kwargs=None):

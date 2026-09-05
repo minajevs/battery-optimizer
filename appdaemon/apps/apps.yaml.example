@@ -383,3 +383,37 @@ battery_optimizer:
 
   # Input select for manual mode selection
   manual_mode_entity: input_select.battery_manual_mode
+
+  # ==========================================================================
+  # Session safety: the durable lease and the heartbeat the reaper watches
+  # ==========================================================================
+  #
+  # This inverter has NO working watchdog: a session armed and left alone was
+  # still armed 50% past its window (2026-09-05), and only an explicit release
+  # ended it. So a process that dies holding one strands the inverter on its
+  # last command until something cleans up.
+  #
+  # The lease is written BEFORE authority is taken and removed only once a
+  # release is confirmed in both halves. It is what lets a later run recognise
+  # a stranded session as ours to RELEASE -- never to resume.
+  session_lease_path: /config/battery_optimizer/session_lease.json
+  # Proof this app is still running, stamped on a timer. The reaper below
+  # watches it go stale.
+  heartbeat_path: /config/battery_optimizer/optimizer_heartbeat.json
+  heartbeat_seconds: 30
+
+# A SEPARATE app, because nothing inside the optimizer can be the answer to the
+# optimizer not running. It can release a stranded session and nothing else.
+#
+# Note the boundary: this is independent of the optimizer app, not of
+# AppDaemon. If the add-on itself dies, both die, and the inverter stays armed
+# until AppDaemon returns -- at which point the lease and startup recovery
+# clean it up.
+session_reaper:
+  module: session_reaper
+  class: SessionReaper
+  device_id: ""                 # the same Growatt device id as above
+  session_lease_path: /config/battery_optimizer/session_lease.json
+  heartbeat_path: /config/battery_optimizer/optimizer_heartbeat.json
+  heartbeat_stale_seconds: 90
+  check_interval_seconds: 60
