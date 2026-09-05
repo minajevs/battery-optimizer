@@ -158,7 +158,7 @@ Common parameters (see `apps.yaml.example` for the full, commented list):
 | `command_timeout_seconds` | 15 | Per‑call `hass_timeout` (old name `set_wit_mode_timeout_seconds` still accepted). **Blocks the AppDaemon callback thread** — see *AppDaemon threads* |
 | `wit_cooldown_seconds` | 30 | The integration's per‑register write cooldown. A collision **defers** a command; it is retried, not dropped |
 | `release_settle_seconds` | 35 | Gap between revoking authority (30100=0) and disarming (30407=0). Scheduled, never slept on |
-| `priority_mode_write` | `auto` | Use register 30476 only once a supervised probe confirms it is genuinely writable; `never` leaves it alone |
+| `priority_mode_write` | `auto` | Use register 30476 only once a supervised probe confirms it is genuinely writable; `never` leaves it alone. Written for **grid charge only** even when confirmed |
 | `battery_power_sensor` | `sensor.growatt_battery_battery_power` | Signed W, **positive = charging**. Required for EFFECT verification |
 | `grid_power_sensor` | `sensor.growatt_grid_grid_power` | Signed W, **positive = exporting** — the opposite convention |
 | `effect_threshold_w` | 200 | Minimum \|W\| that counts as the inverter genuinely acting |

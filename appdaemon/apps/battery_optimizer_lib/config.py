@@ -8,6 +8,23 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# Declared battery-power polarities. There is no "auto": inferring polarity
+# from a live reading needs a known charge/discharge event to calibrate
+# against, and getting it wrong silently inverts every trading verdict. The
+# reference WIT is negative_is_charging, confirmed against SOC movement.
+BATTERY_POWER_DIRECTIONS = ("negative_is_charging", "positive_is_charging")
+
+# How the control backend may talk to the inverter. Ordered by capability.
+#   dry_run       - plan and log register sequences, no I/O at all
+#   read_only     - real register/entity READS; writes remain impossible
+#   commissioning - supervised writes, restricted to the commissioning
+#                   allowlist. The optimizer still does NOT drive the inverter
+#                   in this mode; only deliberately invoked operations write.
+# Anything unrecognised falls back to dry_run: a typo must never be what
+# grants write access to an inverter.
+CONTROL_MODES = ("dry_run", "read_only", "commissioning")
+
+
 # Emitted at startup (config load) and by the DP whenever the deployed
 # configuration pins the end-of-horizon value to zero. Kept as one constant so
 # the config warning, the DP warning and the tests all assert the same text.
@@ -54,15 +71,29 @@ class BatteryOptimizerConfig:
     battery_temp_sensor: str = ""
     battery_charge_sensor: str = "sensor.growatt_battery_charge_today"
     battery_discharge_sensor: str = "sensor.growatt_battery_discharge_today"
-    # Signed INSTANTANEOUS power, for EFFECT verification. The *_today sensors
-    # above are kWh energy counters and cannot resolve a 60-90 s window.
-    # NOTE the two sign conventions are OPPOSITE:
-    #   battery_power_sensor: positive = CHARGING
-    #   grid_power_sensor:    positive = EXPORTING
+    # INSTANTANEOUS power, for EFFECT verification. The *_today sensors above
+    # are kWh energy counters and cannot resolve a 60-90 s window.
+    #
+    # Battery polarity is DECLARED, never assumed. The reference WIT reports
+    # negative while charging (confirmed against SOC movement over a full
+    # charge), but the convention varies by model and by integration option,
+    # so it is configuration. The backend normalizes it exactly once and
+    # everything above the backend sees positive = charging.
     battery_power_sensor: str = "sensor.growatt_battery_battery_power"
+    battery_power_direction: str = "negative_is_charging"
+    # Grid flow for EFFECT uses the two ALWAYS-POSITIVE directional sensors,
+    # never the signed one. Upstream applies its `invert_grid_power` option to
+    # signed Grid Power but explicitly NOT to these two, so no integration
+    # setting can turn an import into an export in trading verification.
+    grid_import_power_sensor: str = "sensor.growatt_grid_grid_import_power"
+    grid_export_power_sensor: str = "sensor.growatt_grid_grid_export_power"
+    # Signed grid power. DIAGNOSTIC ONLY — never an EFFECT input.
     grid_power_sensor: str = "sensor.growatt_grid_grid_power"
     # Minimum |W| that counts as the inverter genuinely acting on a command.
     effect_threshold_w: float = 200.0
+    # Consecutive unambiguous EFFECT failures before control latches degraded:
+    # released to local inverter logic and no longer commanded until cleared.
+    effect_failure_limit: int = 2
     use_inverter_energy_sensors: bool = True
     load_power_sensor: str = ""
 
@@ -356,8 +387,22 @@ class BatteryOptimizerConfig:
         # Inverter control timing / blocking
         self.verify_delay_seconds = max(5, min(600, int(self.verify_delay_seconds)))
         self.verify_recheck_seconds = max(5, min(600, int(self.verify_recheck_seconds)))
-        if self.control_mode not in ("dry_run", "read_only"):
+        if self.control_mode not in CONTROL_MODES:
             self.control_mode = "dry_run"
+        # Polarity is STRICT: an unrecognised value raises rather than falling
+        # back. A silently assumed polarity inverts every trading verdict, and
+        # a default that happens to match one inverter is exactly how that bug
+        # reaches the next one. There is deliberately no "auto" either.
+        if self.battery_power_direction not in BATTERY_POWER_DIRECTIONS:
+            raise ValueError(
+                f"battery_power_direction must be one of "
+                f"{list(BATTERY_POWER_DIRECTIONS)}, got "
+                f"{self.battery_power_direction!r}. This setting has no safe "
+                f"default: confirm the sign on YOUR inverter (watch the "
+                f"battery power sensor while the battery is charging) and "
+                f"declare it in apps.yaml."
+            )
+        self.effect_failure_limit = max(1, min(10, int(self.effect_failure_limit)))
         self.command_timeout_seconds = max(
             5, min(120, int(self.command_timeout_seconds))
         )
@@ -439,8 +484,12 @@ class BatteryOptimizerConfig:
             battery_charge_sensor=args.get("battery_charge_sensor", "sensor.growatt_battery_charge_today"),
             battery_discharge_sensor=args.get("battery_discharge_sensor", "sensor.growatt_battery_discharge_today"),
             battery_power_sensor=args.get("battery_power_sensor", "sensor.growatt_battery_battery_power"),
+            battery_power_direction=args.get("battery_power_direction", "negative_is_charging"),
+            grid_import_power_sensor=args.get("grid_import_power_sensor", "sensor.growatt_grid_grid_import_power"),
+            grid_export_power_sensor=args.get("grid_export_power_sensor", "sensor.growatt_grid_grid_export_power"),
             grid_power_sensor=args.get("grid_power_sensor", "sensor.growatt_grid_grid_power"),
             effect_threshold_w=float(args.get("effect_threshold_w", 200.0)),
+            effect_failure_limit=int(args.get("effect_failure_limit", 2)),
             wit_cooldown_seconds=int(args.get("wit_cooldown_seconds", 30)),
             release_settle_seconds=int(args.get("release_settle_seconds", 35)),
             priority_mode_write=args.get("priority_mode_write", "auto"),

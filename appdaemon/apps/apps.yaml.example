@@ -83,9 +83,51 @@ battery_optimizer:
   battery_discharge_sensor: "sensor.growatt_battery_battery_discharge_today"
   use_inverter_energy_sensors: true
 
+  # --------------------------------------------------------------------------
+  # Instantaneous power, used to verify that a command actually TRADED
+  # --------------------------------------------------------------------------
+  # Battery power polarity is DECLARED, not guessed. Confirm it on your unit
+  # before enabling any write: watch battery SOC while the battery charges and
+  # note the sign this sensor reports.
+  #   negative_is_charging  - the reference Growatt WIT
+  #   positive_is_charging  - other models / integration options
+  battery_power_sensor: "sensor.growatt_battery_battery_power"
+  battery_power_direction: negative_is_charging
+  #
+  # Grid direction comes from the two ALWAYS-POSITIVE sensors, never the signed
+  # one: the integration's `invert_grid_power` option flips signed Grid Power
+  # but explicitly not these, so no HA setting can turn a purchase into a sale.
+  grid_import_power_sensor: "sensor.growatt_grid_grid_import_power"
+  grid_export_power_sensor: "sensor.growatt_grid_grid_export_power"
+  # Signed grid power. Published in diagnostics for humans; never a decision.
+  grid_power_sensor: "sensor.growatt_grid_grid_power"
+  #
+  # Minimum |W| that counts as the inverter genuinely acting on a command.
+  effect_threshold_w: 200
+  # Consecutive "acknowledged but did nothing" verdicts before control latches
+  # degraded: the VPP session is released, the inverter returns to its own
+  # local logic, and no further commands are sent until it is investigated.
+  effect_failure_limit: 2
+
   # ==========================================================================
   # Device Control
   # ==========================================================================
+
+  # NOTE on 30100 (control authority): finding it set is NOT evidence that
+  # something else is controlling the inverter, and 30100=1 with 30407=0 is NOT
+  # treated as a hazard on this hardware despite upstream documenting it as
+  # "VPP standby". Both are reported and neither is acted on. Use
+  # scripts/read_tou_schedule.py to watch what the inverter's own schedule is
+  # actually doing, including snapshot/diff over time.
+
+  # INTERLOCK on 30411 (TOU period count): this IS evidence. No plan in this
+  # project writes a TOU period, so a non-zero count belongs to another
+  # scheduler -- on the reference installation, Growatt Smart Scheduling, which
+  # was observed holding 16 periods and clearing all of them when switched off
+  # (2026-09-03). While 30411 > 0 no session-holding command is transmitted, in
+  # commissioning or automatic control. Releasing is never blocked. Switch the
+  # external scheduler off before commissioning; scripts/read_tou_schedule.py
+  # or scripts/commission.py --operation state shows the current count.
 
   # Growatt WIT device ID for Modbus control
   # Find this in Home Assistant Developer Tools > States > growatt entities
@@ -93,10 +135,17 @@ battery_optimizer:
 
   # How the control backend may talk to the inverter. This, NOT device_id, is
   # what decides whether anything is ever written.
-  #   dry_run    - plan and log register sequences, no I/O at all (default)
-  #   read_only  - real register/entity READS; writes remain impossible
-  # Live writes are a separate, later opt-in. Anything unrecognised falls back
-  # to dry_run: a typo must never be what grants write access to an inverter.
+  #   dry_run       - plan and log register sequences, no I/O at all (default)
+  #   read_only     - real register/entity READS; writes remain impossible
+  #   commissioning - supervised writes ONLY, to a fixed register allowlist
+  #                   (30100/30407/30408/30409/30476). The optimizer still does
+  #                   not drive the inverter: every schedule slot is planned and
+  #                   logged, never transmitted. Writes happen only when a
+  #                   person runs scripts/commission.py, one operation at a
+  #                   time. Grid charge, both discharges and max export are
+  #                   refused outright in this mode.
+  # Unattended live control is a separate, later opt-in. Anything unrecognised
+  # falls back to dry_run: a typo must never be what grants write access.
   control_mode: "dry_run"
 
   # ==========================================================================
@@ -298,6 +347,10 @@ battery_optimizer:
   # others, and may be what remote grid charging depends on. "auto" uses it
   # only once a supervised commissioning probe has CONFIRMED it is genuinely
   # writable; "never" leaves it alone entirely.
+  #
+  # Even under "auto" and confirmed, it is written for GRID_CHARGE only -- the
+  # one action whose hypothesis needs it. A confirmed probe does not make HOLD
+  # or the discharges start changing the inverter's base mode.
   priority_mode_write: "auto"
 
   # ==========================================================================

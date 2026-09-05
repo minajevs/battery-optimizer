@@ -137,6 +137,14 @@ def charge_entry():
     )
 
 
+def discharge_entry():
+    return ScheduleEntry(
+        time=datetime.datetime(2024, 1, 1, 12, 0, 0),
+        mode=BatteryMode.DISCHARGE,
+        reason="test",
+    )
+
+
 def matching(backend, actual="auth=1 remote=1"):
     backend.verdict = VerifyVerdict.MATCH
     backend.actual = actual
@@ -465,6 +473,11 @@ def test_get_diagnostics_shape():
         "last_effect", "release_pending_count",
         "verify_delay_seconds", "verify_recheck_seconds",
         "command_timeout_seconds",
+        # EFFECT escalation: an ACKed command that did nothing releases
+        # control rather than rewriting the inverter's TOU schedule.
+        "control_degraded", "degraded_reason", "degraded_family",
+        "effect_failure_count", "consecutive_effect_failures",
+        "consecutive_effect_failures_max", "effect_failure_limit",
         # Per-outcome tally: a dry run, a suppressed duplicate and an
         # unconfirmed timeout are all "True" from apply_mode, and only
         # sent_count means the inverter acknowledged anything. A rate-limited
@@ -555,6 +568,179 @@ def test_effect_verdict_is_recorded_on_a_match():
 
     assert dc.get_diagnostics()["last_effect"] == "indeterminate"
     assert dc.get_diagnostics()["verified_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# EFFECT failure: release and escalate, never rewrite the TOU schedule
+# ---------------------------------------------------------------------------
+
+def verified_effect(dc, app, backend, verdict, entry=None):
+    """Run one apply + verification cycle ending in ``verdict``."""
+    backend.effect = verdict
+    dc._last_mode_time = None            # bypass duplicate suppression
+    dc.apply_mode(entry or hold_entry())
+    app.fire_last_timer()
+
+
+def test_indeterminate_effect_never_escalates():
+    """PV surplus or absorbed discharge is not a failure."""
+    dc, app, backend = make_dc()
+    matching(backend)
+
+    for _ in range(5):
+        verified_effect(dc, app, backend, EffectVerdict.INDETERMINATE)
+
+    diag = dc.get_diagnostics()
+    assert diag["effect_failure_count"] == 0
+    assert diag["control_degraded"] is False
+    assert backend.released == 0
+
+
+def test_effect_failure_below_the_limit_alerts_but_keeps_control():
+    dc, app, backend = make_dc()
+    matching(backend)
+
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+
+    diag = dc.get_diagnostics()
+    assert diag["effect_failure_count"] == 1
+    assert diag["control_degraded"] is False
+    assert backend.released == 0
+    assert "ERROR" in app.levels()
+    assert any("NO EFFECT" in m for m, _lvl in app.logs)
+
+
+def test_repeated_effect_failure_releases_control_and_latches_degraded():
+    """ACK correct + no effect: hand the battery back, do not touch TOU."""
+    dc, app, backend = make_dc()
+    matching(backend)
+
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+
+    diag = dc.get_diagnostics()
+    assert diag["consecutive_effect_failures"] == {"hold": 2}
+    assert diag["degraded_family"] == "hold"
+    assert diag["control_degraded"] is True
+    assert "EFFECT failures" in diag["degraded_reason"]
+    assert backend.released == 1
+    assert any("CONTROL DEGRADED" in m for m, _lvl in app.logs)
+
+
+def test_degraded_control_stops_commanding_until_cleared():
+    dc, app, backend = make_dc()
+    matching(backend)
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+
+    sends_before = len(backend.sent)
+    dc._last_mode_time = None
+    outcome = dc.apply_mode_with_outcome(charge_entry())
+
+    assert outcome is ApplyOutcome.FAILED
+    assert len(backend.sent) == sends_before      # nothing transmitted
+
+    dc.clear_degraded()
+    dc._last_mode_time = None
+    dc.apply_mode(charge_entry())
+    assert len(backend.sent) == sends_before + 1
+
+
+def test_a_passing_effect_clears_the_failure_streak():
+    """One bad reading between good ones must not accumulate into a latch."""
+    dc, app, backend = make_dc()
+    matching(backend)
+
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+    verified_effect(dc, app, backend, EffectVerdict.PASS)
+    verified_effect(dc, app, backend, EffectVerdict.FAIL)
+
+    diag = dc.get_diagnostics()
+    assert diag["effect_failure_count"] == 2
+    assert diag["consecutive_effect_failures"] == {"hold": 1}
+    assert diag["control_degraded"] is False
+    assert backend.released == 0
+
+
+def test_effect_failure_streaks_do_not_cross_action_families():
+    """A dead grid-charge and a dead discharge are two faults, not two strikes.
+
+    Sharing one counter would latch degraded after one of each, blaming a
+    mechanism neither of them proved broken.
+    """
+    dc, app, backend = make_dc()
+    matching(backend)
+
+    verified_effect(dc, app, backend, EffectVerdict.FAIL, charge_entry())
+    verified_effect(dc, app, backend, EffectVerdict.FAIL, discharge_entry())
+
+    diag = dc.get_diagnostics()
+    assert diag["consecutive_effect_failures"] == {"grid_charge": 1,
+                                                  "discharge": 1}
+    assert diag["control_degraded"] is False
+    assert backend.released == 0
+
+    # A second failure within ONE family is what latches.
+    verified_effect(dc, app, backend, EffectVerdict.FAIL, charge_entry())
+    assert dc.get_diagnostics()["control_degraded"] is True
+    assert dc.get_diagnostics()["degraded_family"] == "grid_charge"
+
+
+def test_the_three_discharge_actions_share_one_family():
+    """They are the same forced-discharge mechanism, differing only in routing."""
+    from battery_optimizer_lib.direct_control import effect_family
+    from battery_optimizer_lib.control import ControlAction
+
+    assert effect_family(ControlAction.DISCHARGE_TO_LOAD) == "discharge"
+    assert effect_family(ControlAction.DISCHARGE_TO_GRID) == "discharge"
+    assert effect_family(ControlAction.MAX_EXPORT) == "discharge"
+    assert effect_family(ControlAction.GRID_CHARGE) == "grid_charge"
+    assert effect_family(ControlAction.HOLD) == "hold"
+
+
+# ---------------------------------------------------------------------------
+# Commissioning: the optimizer does not drive the inverter
+# ---------------------------------------------------------------------------
+
+def test_optimizer_transmits_nothing_when_writes_are_supervised_only():
+    """control_mode: commissioning must not become "the scheduler can trade"."""
+    dc, app, backend = make_dc()
+    backend.automatic_writes_allowed = False
+
+    outcome = dc.apply_mode_with_outcome(charge_entry())
+
+    assert outcome is ApplyOutcome.DRY_RUN
+    assert backend.sent == []                     # nothing reached the backend
+    assert any("COMMISSIONING mode" in m for m, _lvl in app.logs)
+    assert "WARNING" in app.levels()
+
+
+def test_the_commissioning_notice_is_loud_once_then_quiet():
+    """It fires every slot; it must not drown the log."""
+    dc, app, backend = make_dc()
+    backend.automatic_writes_allowed = False
+
+    dc.apply_mode(charge_entry())
+    dc.apply_mode(charge_entry())
+    dc.apply_mode(charge_entry())
+
+    warnings = [m for m, lvl in app.logs
+                if lvl == "WARNING" and "COMMISSIONING mode" in m]
+    debugs = [m for m, lvl in app.logs
+              if lvl == "DEBUG" and "COMMISSIONING mode" in m]
+    assert len(warnings) == 1
+    assert len(debugs) == 2
+    assert backend.sent == []
+
+
+def test_a_backend_without_the_property_is_still_allowed_to_write():
+    """The gate may only ever tighten behaviour, never loosen it."""
+    dc, _app, backend = make_dc()
+    assert not hasattr(backend, "automatic_writes_allowed")
+
+    dc.apply_mode(charge_entry())
+
+    assert len(backend.sent) == 1
 
 
 # ---------------------------------------------------------------------------

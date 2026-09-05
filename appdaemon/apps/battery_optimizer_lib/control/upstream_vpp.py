@@ -6,12 +6,35 @@ Upstream has no ``set_wit_mode``, so one fork service call becomes a sequence of
 VPP register writes.  Three documented hardware facts shape every sequence here,
 and each one has already cost a design revision:
 
-1. **Safe-state pair.** Only 30100/30407 = 0/0 and 1/1 are safe.  1/0 is
-   "VPP standby": local battery logic suspended, load drawn from the grid.
+1. **Pair discipline.** 30100/30407 are written as a pair; 0/0 and 1/1 are the
+   two states this project ever aims for. Upstream documents 1/0 as "VPP
+   standby" — local logic suspended, load drawn from the grid — but the
+   reference WIT was observed at 1/0 discharging 3.8 kW and exporting 2.6 kW
+   (2026-09-03), so that description is treated as an unresolved DISCREPANCY
+   to warn about, not as a hazard to recover from. Nothing acts on 1/0 alone.
 2. **Write order.** 30408 (duration) -> 30409 (power) -> 30407 (enable) LAST.
    Arming first applies whatever stale setpoint 30409 still held.
 3. **EEPROM.** Only 30407/30408/30409 are marked "Not storage" and safe to
    write every slot.  Everything else is written only when it changes.
+4. **The base TOU schedule is not ours.** A timed VPP override is documented as
+   an override: when it expires the inverter returns to its own base schedule.
+   Nothing here needs 30411 cleared to run a session, and the reference
+   installation was found holding a schedule of its own.  So no plan writes
+   30411 at all.
+
+   The origin is no longer a guess.  On 2026-09-03 the reference WIT held 16
+   periods with Growatt Smart Scheduling enabled; turning Smart Scheduling off
+   in the Growatt dashboard zeroed 30411 and all 60 period registers, and they
+   were still zero 44 h later.  Growatt Smart Scheduling writes that schedule
+   and clears it.
+
+   That makes 30411 the one register that identifies a second scheduler
+   POSITIVELY.  30100=1 says only that authority is held — this inverter has
+   been seen holding it while running its own logic — but a non-zero period
+   count cannot be ours, because no code path here writes one.  So
+   ``30411 > 0`` is an INTERLOCK: no session-holding write is transmitted
+   while another scheduler's schedule is loaded.  Releasing is never blocked
+   by it; giving the inverter back is always allowed.
 
 STATUS: this slice builds and logs sequences.  Execution is delegated to an
 ``executor``; the default one is dry-run and performs no I/O whatsoever.
@@ -64,6 +87,24 @@ RATE_LIMITED_REGISTERS = frozenset({
 
 WIT_COOLDOWN_SECONDS = 30
 
+# The TOU fallback for grid charging is NOT implemented, deliberately. It would
+# have to overwrite the inverter's existing TOU schedule, which we neither
+# authored nor can restore. Until VPP grid charging is proven or disproven on
+# real hardware, an unambiguous EFFECT failure releases control and escalates
+# instead. If it is ever built it must first snapshot the whole schedule and
+# have a tested restore path.
+TOU_FALLBACK_ENABLED = False
+
+# The only actions commissioning mode will transmit. Everything that moves
+# energy for money -- grid charge, either discharge, max export -- is excluded:
+# commissioning proves the SESSION machinery (take authority, arm, renew the
+# watchdog, release) and nothing else. HOLD is the least energetic way to do
+# that, because +1 % keeps a session alive while moving almost no power.
+COMMISSIONING_ACTIONS = frozenset({
+    ControlAction.HOLD,
+    ControlAction.PASSTHROUGH,
+})
+
 # 30409 value that means "hold". NOT 0 — that is documented as "suspend forced
 # cycle (passthrough)", and 0 was observed clipping PV. +1% keeps the VPP
 # session active while charging nothing meaningful.
@@ -104,7 +145,9 @@ class SessionState(enum.Enum):
       confirmed revoked, usually because our own successful 30100=1 stamped the
       30 s cooldown that now blocks 30100=0. The retry only exists while this
       process does.
-    * ``ARM_FAILED_AUTHORITY_HELD`` — the documented VPP standby hazard.
+    * ``ARM_FAILED_AUTHORITY_HELD`` — THIS process took authority and then
+      failed to arm, leaving its own command half-applied. The trigger is our
+      own failed write, never an inference from register values.
 
     ``RELEASED`` is reserved for a read-back-confirmed 30100=0. Timer expiry of
     the override is a different thing and must not be conflated with it: the
@@ -117,11 +160,38 @@ class SessionState(enum.Enum):
     RELEASE_PENDING = "release_pending"
     RELEASED = "released"
     ARM_FAILED_AUTHORITY_HELD = "arm_failed_authority_held"
+    # 30100=1 found without this process having taken it.
+    #
+    # This is NOT proof that somebody else is actively controlling the
+    # inverter. 30100 is a register; the reference WIT has been observed with
+    # it set while running its own schedule, and the name says only what is
+    # actually known: the authority is not ours. That is enough to make it a
+    # hard interlock — we never arm on top of authority we cannot account for —
+    # without pretending to know who set it or why.
+    AUTHORITY_HELD_NOT_OURS = "authority_held_not_ours"
 
     @property
     def safe_to_stop(self) -> bool:
-        """True when stopping AppDaemon leaves no unfinished handover."""
-        return self in (SessionState.NOT_ARMED, SessionState.RELEASED)
+        """True when stopping AppDaemon leaves no unfinished handover.
+
+        AUTHORITY_HELD_NOT_OURS counts as safe: we hold nothing, so there is
+        nothing of ours left dangling. It is still a loud state, because what
+        the optimizer plans next is not what the inverter is currently doing.
+        """
+        return self in (SessionState.NOT_ARMED, SessionState.RELEASED,
+                        SessionState.AUTHORITY_HELD_NOT_OURS)
+
+
+# Session states that assert something about THIS process's own authority.
+# reconcile() must never overwrite one from a register read: the registers say
+# what the inverter is doing, not who asked it to.
+OWN_AUTHORITY_STATES = frozenset({
+    SessionState.ACTIVE,
+    SessionState.RELEASE_PENDING,
+    # We took the authority and could not arm it. Ours, and known to be ours
+    # from our own write result rather than from what the registers now read.
+    SessionState.ARM_FAILED_AUTHORITY_HELD,
+})
 
 
 class StepResult(enum.Enum):
@@ -166,6 +236,10 @@ class CommandPlan:
     steps: List[Any] = field(default_factory=list)
     arms_at: Optional[int] = None   # index of the 30407=1 write, if any
     acquires_authority: bool = False
+    # True when the inverter already reported 30100=1, so no acquire step was
+    # planned. The arming write is still the hazard boundary: failing it with
+    # authority held is VPP standby whether or not WE took that authority.
+    authority_already_held: bool = False
 
     def add(self, step: Any) -> None:
         self.steps.append(step)
@@ -196,22 +270,13 @@ class DryRunExecutor:
         return None
 
 
-class HaReadOnlyExecutor:
-    """Real Home Assistant reads. Structurally incapable of writing.
+class _HaRegisterReader:
+    """Shared real-read plumbing. Owns no write capability of any kind.
 
     ``get_register_data`` is one of only two upstream services that returns a
-    response, which is what makes real verification possible without any
-    write capability existing on this object at all.
-
-    There is deliberately no code path here to ``write_register``,
-    ``write_registers`` or ``sync_tou_schedule``: ``execute()`` refuses every
-    step rather than performing it, so an injection mistake cannot silently
-    arm an inverter.
+    response, which is what makes real verification possible. Subclasses decide
+    what — if anything — they will write; nothing here can.
     """
-
-    name = "ha_read_only"
-    can_write = False
-    can_read = True
 
     # get_register_data caps a single read at 50 registers.
     MAX_READ_COUNT = 50
@@ -224,16 +289,7 @@ class HaReadOnlyExecutor:
         self._log = log_func or (lambda *a, **k: None)
         self.read_calls: List[Any] = []
         self.refused: List[Any] = []
-
-    def execute(self, step: Any) -> StepResult:
-        """Refuse. This executor exists precisely so writes cannot happen."""
-        self.refused.append(step)
-        self._log(
-            f"[{self.name}] refusing write step ({step.describe()}) — this "
-            f"executor is read-only",
-            level="ERROR",
-        )
-        return StepResult.FAILED
+        self.writes: List[Any] = []
 
     def read_registers(self, start: int, count: int) -> Optional[List[int]]:
         """Read holding registers via growatt_modbus/get_register_data."""
@@ -261,6 +317,12 @@ class HaReadOnlyExecutor:
 
         return self._extract_values(result, count)
 
+    def _refuse(self, step: Any, reason: str) -> StepResult:
+        self.refused.append(step)
+        self._log(f"[{self.name}] REFUSING {step.describe()} — {reason}",
+                  level="ERROR")
+        return StepResult.FAILED
+
     @staticmethod
     def _extract_values(result: Any, count: int) -> Optional[List[int]]:
         """Pull the values list out of the service response.
@@ -284,6 +346,94 @@ class HaReadOnlyExecutor:
             return None
 
 
+class HaReadOnlyExecutor(_HaRegisterReader):
+    """Real reads. Structurally incapable of writing.
+
+    There is deliberately no code path here to ``write_register``,
+    ``write_registers`` or ``sync_tou_schedule``: ``execute()`` refuses every
+    step rather than performing it, so an injection mistake cannot silently
+    arm an inverter.
+    """
+
+    name = "ha_read_only"
+    can_write = False
+    can_read = True
+    commissioning = False
+
+    def execute(self, step: Any) -> StepResult:
+        """Refuse. This executor exists precisely so writes cannot happen."""
+        return self._refuse(step, "this executor is read-only")
+
+
+class HaCommissioningExecutor(_HaRegisterReader):
+    """Supervised writes, restricted to a fixed register allowlist.
+
+    This is the first executor that can change an inverter, so the limit on
+    WHAT it will change lives here — in the executor — rather than being
+    entrusted to whichever plan happens to be passed in. A plan that somehow
+    contained an export limit, an AC-charge mode or a TOU write is refused at
+    this boundary instead of being obeyed.
+
+    Writes go through ``growatt_modbus/write_register`` (FC06), which returns
+    no response and signals failure by raising — including the WIT cooldown
+    refusal, which is mapped back to RATE_LIMITED so the retry machinery above
+    behaves exactly as it does everywhere else.
+    """
+
+    name = "ha_commissioning"
+    can_write = True
+    can_read = True
+    commissioning = True
+
+    # Exactly what the four supervised operations need, and nothing else.
+    # Notably absent: 30200/30201 (export limit), 30410 (AC charge),
+    # 30404/30405 (SOC cutoffs) and 30411 (the inverter's own TOU schedule).
+    WRITABLE_REGISTERS = frozenset({
+        REG_CONTROL_AUTHORITY,   # 30100 — take/release authority
+        REG_REMOTE_ENABLE,       # 30407 — arm/disarm
+        REG_REMOTE_DURATION,     # 30408 — watchdog duration
+        REG_REMOTE_POWER,        # 30409 — signed setpoint (+1 % HOLD only)
+        REG_PRIORITY_MODE,       # 30476 — capability probe, always restored
+    })
+
+    def execute(self, step: Any) -> StepResult:
+        if not isinstance(step, RegisterWrite):
+            return self._refuse(step, "only register writes are permitted in "
+                                      "commissioning mode")
+        if step.register not in self.WRITABLE_REGISTERS:
+            return self._refuse(
+                step,
+                f"register {step.register} is not in the commissioning "
+                f"allowlist {sorted(self.WRITABLE_REGISTERS)}",
+            )
+
+        self.writes.append(step)
+        try:
+            self.app.call_service(
+                "growatt_modbus/write_register",
+                hass_timeout=self.timeout_seconds,
+                device_id=self.device_id,
+                register=step.register,
+                value=step.value,
+            )
+        except Exception as e:  # noqa: BLE001 - the service raises on failure
+            message = str(e)
+            if "rate-limited" in message.lower() or "cooldown" in message.lower():
+                self._log(
+                    f"[{self.name}] {step.register} refused by the inverter's "
+                    f"own write cooldown: {e}",
+                    level="WARNING",
+                )
+                return StepResult.RATE_LIMITED
+            self._log(
+                f"[{self.name}] write {step.register}={step.value} failed: {e}",
+                level="ERROR",
+            )
+            return StepResult.FAILED
+
+        return StepResult.OK
+
+
 def build_executor(app, config):
     """Pick an executor from config.control_mode. Fails SAFE, never open.
 
@@ -292,14 +442,16 @@ def build_executor(app, config):
     """
     mode = getattr(config, "control_mode", "dry_run")
     log = getattr(app, "log", None)
+    kwargs = dict(
+        device_id=getattr(config, "device_id", ""),
+        timeout_seconds=int(getattr(config, "command_timeout_seconds", 15)),
+        log_func=log,
+    )
 
+    if mode == "commissioning":
+        return HaCommissioningExecutor(app, **kwargs)
     if mode == "read_only":
-        return HaReadOnlyExecutor(
-            app,
-            device_id=getattr(config, "device_id", ""),
-            timeout_seconds=int(getattr(config, "command_timeout_seconds", 15)),
-            log_func=log,
-        )
+        return HaReadOnlyExecutor(app, **kwargs)
     return DryRunExecutor(log)
 
 
@@ -350,17 +502,20 @@ class UpstreamVppBackend:
         self.session_state = SessionState.NOT_ARMED
         self.priority_mode_capability = PriorityModeCapability.UNKNOWN
         self.grid_charge_path = "remote_power"
-        # Raw last-read power values, republished in diagnostics so the two
-        # OPPOSITE sign conventions can be verified on real hardware.
+        # Last-read telemetry, republished in diagnostics so normalization can
+        # be checked against the raw reading on the real installation.
+        self.last_battery_power_raw_w: Optional[float] = None
         self.last_battery_power_w: Optional[float] = None
+        self.last_grid_import_power_w: Optional[float] = None
+        self.last_grid_export_power_w: Optional[float] = None
         self.last_grid_power_w: Optional[float] = None
+        self.last_tou_period_count: Optional[int] = None
         self._release_timer = None
 
         # Last value we successfully wrote per register — drives "write only on
         # change" for the non-EEPROM-safe registers.
         self._applied: Dict[int, int] = {}
         self._wrote_priority_mode = False
-        self._used_tou = False
 
         self._rollback_timer = None
         self._counters: Dict[str, int] = {
@@ -372,6 +527,7 @@ class UpstreamVppBackend:
             "rollback_confirmed": 0,
             "release_attempts": 0,
             "release_deferred": 0,
+            "external_scheduler_refusals": 0,
         }
 
     # --- configuration helpers -------------------------------------------
@@ -386,6 +542,22 @@ class UpstreamVppBackend:
         return bool(getattr(self.executor, "can_read", False))
 
     @property
+    def commissioning(self) -> bool:
+        """True when writes are possible but only as supervised operations."""
+        return bool(getattr(self.executor, "commissioning", False))
+
+    @property
+    def automatic_writes_allowed(self) -> bool:
+        """True only when the OPTIMIZER may drive the inverter unattended.
+
+        Commissioning can write, so ``dry_run`` is False for it — which is
+        exactly why this is a separate question. Answering "can this process
+        write?" would let the scheduler start trading the moment commissioning
+        was enabled.
+        """
+        return not self.dry_run and not self.commissioning
+
+    @property
     def control_status(self) -> str:
         """One unmistakable string for the health sensor.
 
@@ -396,6 +568,8 @@ class UpstreamVppBackend:
         """
         if self.dry_run:
             return "DRY_RUN"
+        if self.commissioning:
+            return f"COMMISSIONING/{self.session_state.value.upper()}"
         return self.session_state.value.upper()
 
     def describe_mode(self) -> str:
@@ -407,6 +581,14 @@ class UpstreamVppBackend:
                 f"possible ({self.executor.name}, {reads}). Register sequences "
                 "are planned and logged only."
             )
+        if self.commissioning:
+            return (
+                f"BATTERY OPTIMIZER CONTROL: COMMISSIONING ({self.executor.name}) "
+                "— supervised writes only. The optimizer does NOT drive the "
+                "inverter in this mode; only deliberately invoked operations "
+                f"({', '.join(sorted(a.value for a in COMMISSIONING_ACTIONS))}, "
+                "priority-mode probe) can write, to a fixed register allowlist."
+            )
         return (
             f"BATTERY OPTIMIZER CONTROL: LIVE ({self.executor.name}) — this "
             "app can write inverter control registers."
@@ -416,6 +598,32 @@ class UpstreamVppBackend:
         log = getattr(self.app, "log", None)
         if log is not None:
             log(f"[{self.name}] {message}", level=level)
+
+    def _read_tou_period_count(self) -> Optional[int]:
+        """Read 30411 on its own. One register, cheap enough to re-read."""
+        read = getattr(self.executor, "read_registers", None)
+        if read is None:
+            return None
+        values = read(REG_TOU_NUM_PERIODS, 1)
+        if not values:
+            return None
+        return values[0]
+
+    def external_scheduler_count(self) -> Optional[int]:
+        """The TOU period count when another scheduler is present, else None.
+
+        Re-read rather than remembered: the whole point of the interlock is
+        that somebody else can load a schedule between two of our slots, and a
+        value cached an hour ago cannot see that. Falls back to the last read
+        when 30411 is momentarily unreadable, so a dropped read cannot quietly
+        clear the interlock.
+        """
+        count = self._read_tou_period_count()
+        if count is None:
+            count = self.last_tou_period_count
+        if count is not None and count > 0:
+            return count
+        return None
 
     def _may_write_priority_mode(self) -> bool:
         """30476 is used only when a supervised probe proved it truly writable."""
@@ -467,12 +675,33 @@ class UpstreamVppBackend:
         if action is ControlAction.PASSTHROUGH:
             return self._build_release_plan()
 
+        if self.commissioning:
+            if action not in COMMISSIONING_ACTIONS:
+                # send() refuses these before ever reaching here; this is the
+                # structural backstop, so a future caller that bypasses send()
+                # cannot get a forbidden sequence built for it either.
+                raise ValueError(
+                    f"{action.value} is not a commissioning operation "
+                    f"(allowed: "
+                    f"{sorted(a.value for a in COMMISSIONING_ACTIONS)})"
+                )
+            return self._build_commissioning_plan(command)
+
         plan = CommandPlan(action=action)
 
         # 1. Policy registers, only when changed. Applied BEFORE the power
         #    command so the inverter is never briefly driven under stale policy.
-        if self._may_write_priority_mode():
-            self._staged(plan, REG_PRIORITY_MODE, 1, "priority mode = Battery First")
+        #
+        #    30476=1 is GRID_CHARGE only. Proving the register writable does
+        #    not establish that anything needs it written: it is a storage
+        #    register that changes the inverter's base mode, and the one
+        #    action with a hypothesis attached — that Battery First is what
+        #    lets a VPP grid charge actually import — is the grid-charge
+        #    experiment. Until hardware evidence shows another action needs
+        #    it, HOLD and the discharges leave the operator's base mode alone.
+        if action is ControlAction.GRID_CHARGE and self._may_write_priority_mode():
+            self._staged(plan, REG_PRIORITY_MODE, 1,
+                         "priority mode = Battery First (grid charge only)")
 
         ac_enable = 1 if action is ControlAction.GRID_CHARGE else 0
         self._staged(plan, REG_AC_CHARGE_ENABLE, ac_enable,
@@ -489,8 +718,9 @@ class UpstreamVppBackend:
         self._staged(plan, REG_EXPORT_LIMIT_ENABLE, exp_enable, "export limit enable")
         self._staged(plan, REG_EXPORT_LIMIT_RATE, exp_rate, "export limit rate %")
 
-        # Clear any TOU periods — the VPP session governs, not a schedule.
-        self._staged(plan, REG_TOU_NUM_PERIODS, 0, "clear TOU periods")
+        # NOTE: 30411 is deliberately NOT written. See fact 4 in the module
+        # docstring — a timed override does not require the base TOU schedule
+        # to be cleared, and that schedule is not ours to destroy.
 
         # 2. Timed override. Both EEPROM-safe, rewritten every slot.
         plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
@@ -499,7 +729,14 @@ class UpstreamVppBackend:
                                note="signed power target"))
 
         # 3. Authority acquired LATE, so a partial failure leaves it un-armed.
-        if self.session_state is not SessionState.ACTIVE:
+        #    Skipped when the inverter already reports 30100=1: that register
+        #    is rate-limited to one write per 30 s, and re-taking authority we
+        #    demonstrably already have spends the budget for nothing. The
+        #    read-back in reconcile() is what seeds _applied here, so an
+        #    inherited session is worked with rather than churned.
+        if self._applied.get(REG_CONTROL_AUTHORITY) == 1:
+            plan.authority_already_held = True
+        elif self.session_state is not SessionState.ACTIVE:
             plan.acquires_authority = True
             plan.add(RegisterWrite(REG_CONTROL_AUTHORITY, 1,
                                    note="acquire authority (late)"))
@@ -511,6 +748,37 @@ class UpstreamVppBackend:
 
         return plan
 
+    def _build_commissioning_plan(self, command: InverterCommand) -> CommandPlan:
+        """The timed override, and nothing else.
+
+        No export policy (30200/30201), no AC charge mode (30410), no SOC
+        cutoffs (30404/30405), no priority mode, no TOU (30411). Commissioning
+        proves that a VPP session can be opened, renewed and released; it does
+        not configure the inverter, and every register it does not need is a
+        register it cannot leave changed.
+        """
+        plan = CommandPlan(action=command.action)
+
+        plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
+                               note="duration (watchdog)"))
+        plan.add(RegisterWrite(REG_REMOTE_POWER, self._power_target(command),
+                               note="signed power target"))
+
+        # Authority is only ever taken FRESH here. Inherited authority is
+        # refused by the commissioning preflight long before this point (see
+        # CommissioningSession), so unlike the normal path there is no
+        # "already held, skip the write" branch to re-use somebody else's.
+        if self.session_state is not SessionState.ACTIVE:
+            plan.acquires_authority = True
+            plan.add(RegisterWrite(REG_CONTROL_AUTHORITY, 1,
+                                   note="acquire authority (late)"))
+
+        # Arm LAST, exactly as the normal path does — this is the ordering the
+        # whole commissioning exercise exists to prove.
+        plan.arms_at = len(plan.steps)
+        plan.add(RegisterWrite(REG_REMOTE_ENABLE, 1, note="ARM (always last)"))
+        return plan
+
     def _build_release_plan(self) -> CommandPlan:
         """PASSTHROUGH: give the inverter fully back to local control (0/0)."""
         plan = CommandPlan(action=ControlAction.PASSTHROUGH)
@@ -518,8 +786,8 @@ class UpstreamVppBackend:
         if self._wrote_priority_mode and self._may_write_priority_mode():
             plan.add(RegisterWrite(REG_PRIORITY_MODE, 0,
                                    note="restore priority mode = Load First"))
-        if self._used_tou:
-            plan.add(RegisterWrite(REG_TOU_NUM_PERIODS, 0, note="clear TOU periods"))
+        # No 30411 write here either: releasing gives the inverter back to its
+        # own base schedule, which is exactly the schedule we never touched.
 
         # Authority first: local logic resumes on revocation. 30407=0 follows
         # after release_settle_seconds, SCHEDULED (never slept on).
@@ -552,6 +820,40 @@ class UpstreamVppBackend:
         return result
 
     def send(self, command: InverterCommand) -> SendResult:
+        if self.commissioning and command.action not in COMMISSIONING_ACTIONS:
+            self._log(
+                f"REFUSED: {command.action.value} is not a commissioning "
+                f"operation. This mode transmits only "
+                f"{sorted(a.value for a in COMMISSIONING_ACTIONS)} — nothing "
+                f"was sent to the inverter.",
+                level="ERROR",
+            )
+            return SendResult.FAILED
+
+        # The external-scheduler interlock. Checked here because send() is the
+        # one door every command goes through, commissioning and automatic
+        # alike -- the commissioning preflight refuses earlier and on a fresher
+        # read, and this is the backstop under it.
+        #
+        # PASSTHROUGH is exempt on purpose: it gives the inverter back, which
+        # is exactly what should stay possible when a second scheduler turns
+        # up. An interlock that could trap a session open would be a worse
+        # hazard than the one it guards against.
+        if command.action.holds_session and not self.dry_run:
+            periods = self.external_scheduler_count()
+            if periods is not None:
+                self._counters["external_scheduler_refusals"] += 1
+                self._log(
+                    f"REFUSED {command.action.value}: 30411 reports {periods} "
+                    f"TOU period(s). This project never writes one, so the "
+                    f"schedule is another scheduler's (Growatt Smart "
+                    f"Scheduling on the reference unit). Nothing was sent -- "
+                    f"turn the external scheduler off, or clear its schedule, "
+                    f"before commanding this inverter.",
+                    level="ERROR",
+                )
+                return SendResult.FAILED
+
         plan = self.build_plan(command)
 
         if self.dry_run:
@@ -587,15 +889,18 @@ class UpstreamVppBackend:
         for line in plan.describe():
             self._log(f"DRY RUN      {line}")
 
-        if state is not None and state.in_vpp_standby:
+        if state is not None and state.authority_without_remote:
             self._log(
-                "inverter is currently in VPP standby (30100=1, 30407=0): local "
-                "battery logic is suspended and load is drawn from the grid",
+                "inverter is currently at 30100=1 / 30407=0. Upstream calls "
+                "this VPP standby; this hardware has been observed discharging "
+                "and exporting in it. Reported, not acted on.",
                 level="WARNING",
             )
 
     def _execute_plan(self, plan: CommandPlan) -> SendResult:
-        authority_taken = False
+        # Authority we inherited counts the same as authority we just took:
+        # either way, failing the arming write leaves 30100=1 / 30407=0.
+        authority_taken = plan.authority_already_held
 
         for index, step in enumerate(plan.steps):
             result = self._execute_step(step)
@@ -624,22 +929,29 @@ class UpstreamVppBackend:
         return SendResult.CONFIRMED
 
     def _enter_arm_failed(self) -> None:
-        """Authority held but arming failed — the documented VPP standby hazard.
+        """WE took authority and then failed to arm. Undo what we did.
 
-        The obvious rollback (30100=0) CANNOT land: our own successful 30100=1
-        stamped the cooldown, so the revoke is refused for up to 30 s. So it is
-        scheduled rather than attempted, and retried until a read-back confirms
-        30100 == 0.
+        This is the one place that still recovers automatically, and the
+        distinction matters: the trigger is our own write result — we know we
+        took 30100 and we know 30407 did not land — not an inference drawn
+        from finding two registers in a particular combination. Leaving a
+        command of ours half-applied is a bug we caused; 1/0 discovered on an
+        inverter we have not written to is not.
+
+        The obvious rollback (30100=0) CANNOT land immediately: our own
+        successful 30100=1 stamped the cooldown, so the revoke is refused for
+        up to 30 s. It is scheduled rather than attempted, and retried until a
+        read-back confirms 30100 == 0.
         """
         self.session_state = SessionState.ARM_FAILED_AUTHORITY_HELD
         self._counters["arm_failures"] += 1
         remaining = self.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY)
         self._log(
-            "ARMING FAILED with control authority held — the inverter is in VPP "
-            "standby (30100=1, 30407=0): local battery logic is suspended and "
-            f"load is drawn from the grid. Authority revoke is rate-limited for "
-            f"{remaining:.0f}s; scheduling rollback.",
-            level="CRITICAL",
+            "ARMING FAILED after this process took control authority: 30100=1 "
+            "landed and 30407=1 did not, so OUR command is half-applied. "
+            f"Authority revoke is rate-limited for {remaining:.0f}s; scheduling "
+            f"the rollback of the authority we took.",
+            level="ERROR",
         )
         self._schedule_rollback(remaining)
 
@@ -804,10 +1116,12 @@ class UpstreamVppBackend:
           fresh start would rewrite every policy register even when the
           inverter already holds the right value — against a 30 s per-register
           cooldown.
-        * **Inherited state.** AppDaemon may restart into an inverter already
-          under VPP control, possibly one this app never armed. Growatt Smart
-          Scheduling has been observed moving 30100 on its own, so finding
-          authority held is not proof it is ours.
+        * **Inherited state.** AppDaemon may restart into an inverter that
+          already has 30100 set, which this app never wrote. Finding authority
+          held is not proof it is ours — and equally, it is not proof that
+          anything else is actively controlling the inverter. It is treated as
+          exactly what it is: authority we cannot account for, and therefore
+          must not arm on top of.
         """
         if not self.can_read:
             return None
@@ -831,28 +1145,159 @@ class UpstreamVppBackend:
             if value is not None:
                 self._applied[register] = value
 
-        if state.in_vpp_standby:
-            self.session_state = SessionState.ARM_FAILED_AUTHORITY_HELD
-            self._log(
-                "found the inverter in VPP STANDBY at startup (30100=1, "
-                "30407=0): local battery logic is suspended and load is drawn "
-                "from the grid. This app did not necessarily cause it — "
-                "Growatt Smart Scheduling can move 30100 independently. "
-                "Scheduling a release.",
-                level="CRITICAL",
-            )
-            self._schedule_rollback(
-                self.cooldown.seconds_remaining(REG_CONTROL_AUTHORITY))
-        elif state.control_authority == 1 and state.remote_enabled == 1:
-            self.session_state = SessionState.ACTIVE
-            self._log(
-                f"found an ACTIVE VPP session at startup ({state.describe()}); "
-                f"adopting it")
-        else:
+        if state.authority_held:
+            if self.session_state in OWN_AUTHORITY_STATES:
+                # Ours, re-observed. Commissioning reconciles before EVERY
+                # operation, so this branch is reached mid-session, mid-release
+                # and after a failed arm, and must not demote authority this
+                # process actually holds. Those states are set from our own
+                # write results -- never inferred from registers -- which is
+                # what makes them the proof of ownership.
+                self._log(
+                    f"re-confirmed the authority this process holds "
+                    f"(session_state={self.session_state.value})",
+                    level="DEBUG")
+            else:
+                # 30100=1 without this process having taken it. Deliberately
+                # NOT called external control: 30100 is a register, and this
+                # inverter has been seen holding it while running its own
+                # schedule. All that is actually known is that the authority
+                # is not ours, which is reason enough never to arm on top of
+                # it, and not reason to claim who set it.
+                self.session_state = SessionState.AUTHORITY_HELD_NOT_OURS
+                self._log(
+                    f"30100=1 but this process did not take it "
+                    f"({state.describe()}). Reported as "
+                    f"AUTHORITY_HELD_NOT_OURS: not adopted, not attributed to "
+                    f"anyone in particular, and never armed on top of.",
+                    level="WARNING",
+                )
+
+            if state.authority_without_remote:
+                # Warned about, acted on by nobody. Upstream calls 1/0 "VPP
+                # standby" with local logic suspended; this hardware was
+                # observed at 1/0 discharging and exporting. Until that is
+                # resolved, the pair is a discrepancy to report, not a fault
+                # to recover from -- so there is no rollback scheduled here in
+                # ANY mode, however capable of writing it is.
+                self._log(
+                    "30100=1 with 30407=0. Upstream documents this pair as VPP "
+                    "standby (local battery logic suspended, load drawn from "
+                    "the grid), but this installation has been observed in it "
+                    "while discharging and exporting. The discrepancy is "
+                    "unresolved: nothing is being recovered or released on the "
+                    "strength of these two registers alone.",
+                    level="WARNING",
+                )
+        elif self.session_state not in (SessionState.RELEASED,
+                                        SessionState.RELEASE_PENDING):
+            # Authority is not held. RELEASED is kept as-is ("we released it"
+            # is stronger and still true than "never armed"), and a pending
+            # release is left for its own scheduled retry to resolve rather
+            # than being raced by a read.
             self.session_state = SessionState.NOT_ARMED
+
+        if state.external_scheduler_present:
+            self._log(
+                f"30411 reports {state.tou_period_count} TOU period(s). No "
+                f"plan in this project writes a TOU period, so this schedule "
+                f"is not ours -- on the reference unit it is Growatt Smart "
+                f"Scheduling's. Session-holding writes are INTERLOCKED while "
+                f"it is loaded; releasing stays available.",
+                level="WARNING",
+            )
 
         self._log(f"reconciled with inverter: {state.describe()}")
         return state
+
+    # --- supervised capability probe --------------------------------------
+
+    def probe_priority_mode(self, state: InverterState):
+        """Value-CHANGING probe of 30476, always followed by a restore.
+
+        Write-same proves only that the address accepts FC06. Only a probe that
+        actually changes the value and reads that change back can license using
+        30476=1 in normal operation. It therefore mutates the inverter's base
+        mode, which is why it exists solely as a supervised commissioning
+        operation and never runs inside a slot.
+
+        30476 is a storage register, so this spends two EEPROM writes. If the
+        restore does not land the inverter is left in a base mode the operator
+        did not choose, which is reported at CRITICAL rather than swallowed.
+
+        Returns ``(capability, detail)``; also updates
+        ``self.priority_mode_capability``.
+        """
+        original = state.priority_mode
+        if original is None:
+            return (PriorityModeCapability.UNKNOWN,
+                    "30476 could not be read; not probing")
+
+        target = 0 if original != 0 else 1
+
+        result = self._execute_step(RegisterWrite(
+            REG_PRIORITY_MODE, target,
+            note=f"probe: change priority mode {original} -> {target}"))
+        if result is not StepResult.OK:
+            self.priority_mode_capability = PriorityModeCapability.REJECTED
+            detail = (f"30476 refused the write ({result.value}); the inverter "
+                      f"remains at {original}")
+            self._log(f"priority mode probe: {detail}", level="WARNING")
+            return self.priority_mode_capability, detail
+
+        observed = self._read_priority_mode()
+
+        if observed == target:
+            self.priority_mode_capability = PriorityModeCapability.CONFIRMED_WRITABLE
+            detail = f"30476 changed {original} -> {observed} and read back"
+        elif observed is None:
+            self.priority_mode_capability = PriorityModeCapability.WRITE_ACCEPTED
+            detail = ("30476 accepted the write but could not be read back; "
+                      "the change is unproven")
+        else:
+            self.priority_mode_capability = PriorityModeCapability.WRITE_ACCEPTED
+            detail = (f"30476 accepted the write but still reads {observed}: "
+                      f"accepted is not the same as writable")
+
+        restored = self._restore_priority_mode(original, observed)
+        detail = f"{detail}; {restored}"
+        self._log(f"priority mode probe: {detail}")
+        return self.priority_mode_capability, detail
+
+    def _restore_priority_mode(self, original: int, observed) -> str:
+        """Put 30476 back exactly as it was found."""
+        if observed == original:
+            return "nothing to restore (value never changed)"
+
+        result = self._execute_step(RegisterWrite(
+            REG_PRIORITY_MODE, original, note="probe: restore priority mode"))
+        if result is not StepResult.OK:
+            self._log(
+                f"PRIORITY MODE NOT RESTORED: 30476 could not be written back "
+                f"to {original} ({result.value}). The inverter's base mode is "
+                f"NOT what it was before the probe — restore it by hand.",
+                level="CRITICAL",
+            )
+            return f"RESTORE FAILED ({result.value})"
+
+        back = self._read_priority_mode()
+        if back != original:
+            self._log(
+                f"PRIORITY MODE RESTORE UNCONFIRMED: 30476 reads {back}, "
+                f"expected {original}. Verify the inverter's base mode by hand.",
+                level="CRITICAL",
+            )
+            return f"restore unconfirmed (reads {back}, expected {original})"
+        return f"restored to {original} and confirmed"
+
+    def _read_priority_mode(self):
+        read = getattr(self.executor, "read_registers", None)
+        if read is None:
+            return None
+        values = read(REG_PRIORITY_MODE, 1)
+        if not values:
+            return None
+        return values[0]
 
     # --- verification -----------------------------------------------------
 
@@ -879,14 +1324,23 @@ class UpstreamVppBackend:
         mirror = at(tail, 0)
         rate = at(export, 1)
 
-        battery_power = self._read_power(
+        battery_raw = self._read_power(
             getattr(self.config, "battery_power_sensor", ""))
-        grid_power = self._read_power(
+        battery_power = self._normalize_battery_power(battery_raw)
+        grid_import = self._read_power(
+            getattr(self.config, "grid_import_power_sensor", ""))
+        grid_export = self._read_power(
+            getattr(self.config, "grid_export_power_sensor", ""))
+        grid_signed = self._read_power(
             getattr(self.config, "grid_power_sensor", ""))
-        # Remembered for diagnostics: these two carry OPPOSITE sign conventions
-        # and must be verifiable against the real installation.
+        # Remembered for diagnostics: raw beside normalized is what makes a
+        # wrong battery_power_direction visible at a glance on real hardware.
+        self.last_battery_power_raw_w = battery_raw
         self.last_battery_power_w = battery_power
-        self.last_grid_power_w = grid_power
+        self.last_grid_import_power_w = grid_import
+        self.last_grid_export_power_w = grid_export
+        self.last_grid_power_w = grid_signed
+        self.last_tou_period_count = at(block, 7)
 
         return InverterState(
             control_authority=at(authority, 0),
@@ -902,10 +1356,29 @@ class UpstreamVppBackend:
             vpp_setpoint_mirror=None if mirror is None else decode_signed(mirror),
             priority_mode=at(tail, 2),
             battery_power_w=battery_power,
-            grid_power_w=grid_power,
+            battery_power_raw_w=battery_raw,
+            grid_import_power_w=grid_import,
+            grid_export_power_w=grid_export,
+            grid_power_w=grid_signed,
             soc_percent=self._read_power(
                 getattr(self.config, "soc_sensor", "")),
         )
+
+    def _normalize_battery_power(
+        self, raw: Optional[float]
+    ) -> Optional[float]:
+        """Convert the sensor's polarity to the internal one: + = charging.
+
+        Declared in config, never detected. The reference WIT reports negative
+        while charging; other Growatt families have been reported the other
+        way round, and guessing per-reading would silently invert every
+        trading verdict. See BATTERY_POWER_DIRECTIONS in config.py.
+        """
+        if raw is None:
+            return None
+        direction = getattr(self.config, "battery_power_direction",
+                            "negative_is_charging")
+        return -raw if direction == "negative_is_charging" else raw
 
     def _read_power(self, entity: str) -> Optional[float]:
         if not entity:
@@ -961,14 +1434,19 @@ class UpstreamVppBackend:
     ) -> EffectVerdict:
         """Is the inverter actually TRADING, not merely moving the battery?
 
-        The two sign conventions are opposite and mixing them would read an
-        import as an export:
-            battery_power_w > 0  ->  CHARGING
-            grid_power_w    > 0  ->  EXPORTING
+        Two properties keep this honest on hardware whose conventions we do
+        not control:
+
+        * ``battery_power_w`` arrives already NORMALIZED (positive = charging),
+          so no per-model polarity reaches this logic;
+        * grid flow comes from the two ALWAYS-POSITIVE directional readings,
+          never the signed one, so the integration's ``invert_grid_power``
+          option cannot turn a purchase into a sale here.
         """
         threshold = float(getattr(self.config, "effect_threshold_w", 200))
         battery = state.battery_power_w
-        grid = state.grid_power_w
+        imported = state.grid_import_power_w
+        exported = state.grid_export_power_w
 
         if battery is None:
             return EffectVerdict.INDETERMINATE
@@ -985,9 +1463,9 @@ class UpstreamVppBackend:
                     # A full battery is not a failed command.
                     return EffectVerdict.INDETERMINATE
                 return EffectVerdict.FAIL
-            if grid is None:
+            if imported is None:
                 return EffectVerdict.INDETERMINATE
-            if grid < -threshold:
+            if imported > threshold:
                 return EffectVerdict.PASS     # importing — genuinely buying
             # Charging, but PV surplus can explain it. Not proof either way.
             return EffectVerdict.INDETERMINATE
@@ -1000,9 +1478,9 @@ class UpstreamVppBackend:
                 return EffectVerdict.FAIL
             if not action.exports_to_grid:
                 return EffectVerdict.PASS
-            if grid is None:
+            if exported is None:
                 return EffectVerdict.INDETERMINATE
-            if grid > threshold:
+            if exported > threshold:
                 return EffectVerdict.PASS     # exporting — genuinely selling
             # Discharging, but house load absorbs it all. Not selling.
             return EffectVerdict.INDETERMINATE
@@ -1014,7 +1492,15 @@ class UpstreamVppBackend:
         """Has the inverter a legitimate reason to ignore the command?
 
         Without this, a battery that is simply full would look like a failed
-        grid-charge and latch the TOU fallback permanently.
+        grid-charge and escalate a healthy system.
+
+        The discharge limb reads 30405, which is the VPP-cluster cutoff. It is
+        used here ONLY to downgrade a FAIL to INDETERMINATE. It is emphatically
+        not the optimizer's reserve: the reference inverter was observed
+        discharging to 18 % under ordinary Load First operation with 30405=20,
+        so 30405 does not describe local-mode behaviour. The authoritative
+        "do not sell below here" rule is the optimizer's own configured
+        min_soc (DirectControl._get_min_soc).
         """
         soc = state.soc_percent
         if soc is None:
@@ -1033,10 +1519,19 @@ class UpstreamVppBackend:
             "executor": getattr(self.executor, "name", "unknown"),
             "control_status": self.control_status,
             "dry_run": self.dry_run,
+            "commissioning": self.commissioning,
+            "automatic_writes_allowed": self.automatic_writes_allowed,
             "can_read": self.can_read,
             "session_state": self.session_state.value,
             "safe_to_stop": self.session_state.safe_to_stop,
             "grid_charge_path": self.grid_charge_path,
+            "tou_fallback": "enabled" if TOU_FALLBACK_ENABLED else "disabled",
+            "tou_period_count": self.last_tou_period_count,
+            "external_scheduler_present": (
+                self.last_tou_period_count is not None
+                and self.last_tou_period_count > 0),
+            "external_scheduler_refusals": (
+                self._counters["external_scheduler_refusals"]),
             "priority_mode_capability": self.priority_mode_capability.value,
             "arm_failures": self._counters["arm_failures"],
             "rate_limited_steps": self._counters["rate_limited"],
@@ -1044,13 +1539,18 @@ class UpstreamVppBackend:
             "rollback_confirmed": self._counters["rollback_confirmed"],
             "release_attempts": self._counters["release_attempts"],
             "release_deferred": self._counters["release_deferred"],
-            # Raw signed telemetry, republished so the OPPOSITE sign
-            # conventions can be confirmed on the real installation:
-            #   battery_power_w > 0 = CHARGING
-            #   grid_power_w    > 0 = EXPORTING
+            # Telemetry, republished so normalization is verifiable on the
+            # real installation: raw beside normalized makes a wrong
+            # battery_power_direction obvious at a glance.
             "battery_power_sensor": getattr(
                 self.config, "battery_power_sensor", ""),
-            "battery_power_w": self.last_battery_power_w,
-            "grid_power_sensor": getattr(self.config, "grid_power_sensor", ""),
-            "grid_power_w": self.last_grid_power_w,
+            "battery_power_direction": getattr(
+                self.config, "battery_power_direction", ""),
+            "battery_power_raw_w": self.last_battery_power_raw_w,
+            "battery_power_normalized_w": self.last_battery_power_w,
+            "grid_import_power_w": self.last_grid_import_power_w,
+            "grid_export_power_w": self.last_grid_export_power_w,
+            # Signed grid power is published for humans only. Nothing in the
+            # EFFECT path reads it, because its sign is an integration option.
+            "grid_power_signed_w_diagnostic_only": self.last_grid_power_w,
         }

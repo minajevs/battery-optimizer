@@ -51,11 +51,24 @@ BLOCKS = [
 
 SIGNED = {30201, 30409, 30474}   # marked with * above
 
+# Confirmed on the reference WIT (2026-09-02) rather than assumed:
+#   * battery: SOC climbed 19->54 % while this sensor read -200..-2400 W, and
+#     the only SOC decreases coincided with positive values.
+#   * grid: a simultaneous read gave grid_power=-793.2 with
+#     grid_export_power=+793.2 and grid_import_power=0.
+# The signed grid sensor is subject to the integration's `invert_grid_power`
+# option; the two directional sensors are not, which is why the optimizer
+# verifies trades against those instead.
 POWER_SENSORS = [
     ("battery_power", "sensor.growatt_battery_battery_power",
-     "positive = CHARGING"),
+     "negative = CHARGING on the reference WIT (declared, see "
+     "battery_power_direction)"),
+    ("grid_import_power", "sensor.growatt_grid_grid_import_power",
+     "always positive; > 0 means BUYING"),
+    ("grid_export_power", "sensor.growatt_grid_grid_export_power",
+     "always positive; > 0 means SELLING"),
     ("grid_power", "sensor.growatt_grid_grid_power",
-     "positive = EXPORTING"),
+     "signed, DIAGNOSTIC ONLY — sign depends on invert_grid_power"),
 ]
 
 
@@ -111,7 +124,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--battery-power-entity",
                         default=POWER_SENSORS[0][1])
-    parser.add_argument("--grid-power-entity", default=POWER_SENSORS[1][1])
+    parser.add_argument("--grid-import-power-entity",
+                        default=POWER_SENSORS[1][1])
+    parser.add_argument("--grid-export-power-entity",
+                        default=POWER_SENSORS[2][1])
+    parser.add_argument("--grid-power-entity", default=POWER_SENSORS[3][1])
     args = parser.parse_args()
 
     base = args.ha_url.rstrip("/")
@@ -147,11 +164,13 @@ def main() -> int:
             print(f"    {label:<52} = {shown}")
         print()
 
-    # The two OPPOSITE sign conventions, read live so they can be confirmed.
+    # Read live so the conventions can be re-confirmed on any installation.
     print("--- power telemetry (verify the sign conventions) ---")
     for entity, meaning in (
-        (args.battery_power_entity, "positive = CHARGING"),
-        (args.grid_power_entity, "positive = EXPORTING"),
+        (args.battery_power_entity, POWER_SENSORS[0][2]),
+        (args.grid_import_power_entity, POWER_SENSORS[1][2]),
+        (args.grid_export_power_entity, POWER_SENSORS[2][2]),
+        (args.grid_power_entity, POWER_SENSORS[3][2]),
     ):
         try:
             state = _get(f"{base}/api/states/{entity}", args.token,
@@ -169,6 +188,10 @@ def main() -> int:
           "what the inverter is doing.")
     print("  30476 is priority_mode: 0=Load First, 1=Battery First, "
           "2=Grid First.")
+    print("  30411 is the inverter's OWN base TOU schedule. Nothing in this "
+          "project writes it.")
+    print("  30405 is the VPP discharge cutoff, NOT a proven local-mode floor "
+          "(observed discharging to 18 % with 30405=20).")
     return 0 if ok else 1
 
 

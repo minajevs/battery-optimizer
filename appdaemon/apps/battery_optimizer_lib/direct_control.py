@@ -23,6 +23,7 @@ from typing import Optional
 
 from .control import (
     ControlAction,
+    EffectVerdict,
     InverterCommand,
     SendResult,
     UpstreamVppBackend,
@@ -44,6 +45,21 @@ VERIFY_RECHECK_SECONDS = 60
 
 # Per-command timeout budget passed to the backend.
 COMMAND_TIMEOUT_SECONDS = 15
+
+
+def effect_family(action: ControlAction) -> str:
+    """Which EFFECT failures accumulate together.
+
+    A grid-charge that does nothing and a discharge that does nothing are two
+    different faults with two different causes. Sharing one counter would latch
+    control degraded after one of each — blaming a mechanism that neither of
+    them showed to be broken, and hiding which one actually is. The three
+    discharge actions DO share a family: they are the same forced-discharge
+    mechanism differing only in where the energy is allowed to go.
+    """
+    if action.is_discharge:
+        return "discharge"
+    return action.value
 
 
 class ApplyOutcome(enum.Enum):
@@ -134,6 +150,21 @@ class DirectControl:
         self._last_mismatch: Optional[dict] = None
         self._last_effect: Optional[str] = None
 
+        # EFFECT failure handling. An ACKed command with no effect is the one
+        # failure mode registers cannot show, so it gets its own escalation:
+        # release and stop, never rewrite the inverter's TOU schedule.
+        self._effect_failure_count = 0
+        # Streaks are per action family, never global — see effect_family().
+        self._consecutive_effect_failures: dict = {}
+        self._control_degraded = False
+        self._degraded_reason: Optional[str] = None
+        self._degraded_family: Optional[str] = None
+        # Commissioning notice is loud once, then quiet: it fires every slot.
+        self._commissioning_notice_logged = False
+        self._effect_failure_limit = int(
+            getattr(config, "effect_failure_limit", 2)
+        )
+
         self.last_apply_outcome: Optional[ApplyOutcome] = None
         self._apply_outcome_counts: dict = {}
 
@@ -196,6 +227,28 @@ class DirectControl:
             )
             return self._record_outcome(ApplyOutcome.DRY_RUN)
 
+        if not self._automatic_writes_allowed():
+            level = "WARNING" if not self._commissioning_notice_logged else "DEBUG"
+            self._commissioning_notice_logged = True
+            self.app.log(
+                f"DirectControl: COMMISSIONING mode — the optimizer does not "
+                f"drive the inverter. {entry.mode.name} was planned but NOT "
+                f"transmitted. Use CommissioningSession for supervised "
+                f"operations.",
+                level=level,
+            )
+            return self._record_outcome(ApplyOutcome.DRY_RUN)
+
+        if self._control_degraded:
+            self.app.log(
+                f"DirectControl: control is DEGRADED ({self._degraded_reason}) "
+                f"— not sending {entry.mode.name}. The inverter is running its "
+                f"own local logic. This needs investigation, then "
+                f"clear_degraded() to resume.",
+                level="ERROR",
+            )
+            return self._record_outcome(ApplyOutcome.FAILED)
+
         command = self.build_command(entry)
 
         if self._is_duplicate(command):
@@ -207,6 +260,17 @@ class DirectControl:
             return self._record_outcome(ApplyOutcome.SKIPPED_DUPLICATE)
 
         return self._dispatch(command)
+
+    def _automatic_writes_allowed(self) -> bool:
+        """False in commissioning mode, where writes are supervised only.
+
+        Deliberately NOT ``not backend.dry_run``: commissioning CAN write, so
+        that question has the wrong answer here — it would let the scheduler
+        start trading the moment commissioning was switched on. Backends that
+        do not publish the property (test doubles) are treated as permitted, so
+        this gate can only ever tighten behaviour, never loosen it.
+        """
+        return bool(getattr(self.backend, "automatic_writes_allowed", True))
 
     def _dispatch(self, command: InverterCommand) -> ApplyOutcome:
         """Send one already-built command and account for the result."""
@@ -481,6 +545,7 @@ class DirectControl:
                         f"(effect: {result.effect.value})",
                         level="DEBUG",
                     )
+                self._handle_effect(command, result)
                 return
 
             self._mismatch_count += 1
@@ -540,6 +605,71 @@ class DirectControl:
                 level="ERROR",
             )
 
+    def _handle_effect(self, command: InverterCommand, result) -> None:
+        """React to the EFFECT verdict on a command the inverter ACKnowledged.
+
+        ACK correct + EFFECT FAIL is the combination registers alone cannot
+        reveal: everything reads back exactly as sent and the inverter is doing
+        something else. The rejected answer to it was to rewrite the inverter's
+        TOU schedule as a fallback path. That schedule is not ours — the
+        reference unit was found holding 15 periods this project never authored
+        — so the answer is to stop trading instead: release the session, hand
+        the battery back to local logic, and escalate for a human.
+
+        INDETERMINATE must never escalate. PV surplus explaining a charge, or
+        house load absorbing a discharge, is not a failure, and treating it as
+        one is how a healthy system latches a fallback it did not need.
+        """
+        family = effect_family(command.action)
+
+        if result.effect is not EffectVerdict.FAIL:
+            if result.effect is EffectVerdict.PASS:
+                self._consecutive_effect_failures.pop(family, None)
+            return
+
+        self._effect_failure_count += 1
+        streak = self._consecutive_effect_failures.get(family, 0) + 1
+        self._consecutive_effect_failures[family] = streak
+        action_name = command.action.value
+        self.app.log(
+            f"DirectControl: {action_name} was ACKNOWLEDGED but had NO EFFECT "
+            f"({streak}/{self._effect_failure_limit} for the '{family}' "
+            f"family) — the control registers read back correctly and the "
+            f"inverter is not acting on them. Inverter reports "
+            f"'{result.actual}'.",
+            level="ERROR",
+        )
+
+        if streak < self._effect_failure_limit:
+            return
+
+        self._control_degraded = True
+        self._degraded_family = family
+        self._degraded_reason = (
+            f"{streak} consecutive EFFECT failures in the '{family}' family "
+            f"(last action: {action_name})"
+        )
+        self.app.log(
+            "DirectControl: CONTROL DEGRADED — releasing the VPP session so the "
+            "inverter returns to its own local logic. No further commands will "
+            "be sent until this is investigated. The inverter's existing TOU "
+            "schedule has NOT been modified.",
+            level="ERROR",
+        )
+        self.release_control()
+
+    def clear_degraded(self) -> None:
+        """Resume commanding after a supervised investigation."""
+        if not self._control_degraded:
+            return
+        self._control_degraded = False
+        self._degraded_reason = None
+        self._degraded_family = None
+        self._consecutive_effect_failures.clear()
+        self.app.log(
+            "DirectControl: degraded state cleared — commanding resumes"
+        )
+
     # --- diagnostics ------------------------------------------------------
 
     def get_diagnostics(self) -> dict:
@@ -581,6 +711,15 @@ class DirectControl:
             "release_pending_count": self._release_pending_count,
             "last_mismatch": self._last_mismatch,
             "last_effect": self._last_effect,
+            "control_degraded": self._control_degraded,
+            "degraded_reason": self._degraded_reason,
+            "degraded_family": self._degraded_family,
+            "effect_failure_count": self._effect_failure_count,
+            "consecutive_effect_failures": dict(self._consecutive_effect_failures),
+            "consecutive_effect_failures_max": max(
+                self._consecutive_effect_failures.values(), default=0
+            ),
+            "effect_failure_limit": self._effect_failure_limit,
             "verify_delay_seconds": self._verify_delay,
             "verify_recheck_seconds": self._verify_recheck_delay,
             "command_timeout_seconds": self._command_timeout,

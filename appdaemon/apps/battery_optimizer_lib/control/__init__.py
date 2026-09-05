@@ -10,9 +10,16 @@ from .backend import (
     VerifyResult,
     VerifyVerdict,
 )
+from .commissioning import (
+    CommissioningResult,
+    CommissioningSession,
+    DEFAULT_COMMISSIONING_MINUTES,
+)
 from .upstream_vpp import (
+    COMMISSIONING_ACTIONS,
     CommandPlan,
     DryRunExecutor,
+    HaCommissioningExecutor,
     HaReadOnlyExecutor,
     build_executor,
     PriorityModeCapability,
@@ -36,8 +43,13 @@ __all__ = [
     "SendResult",
     "VerifyResult",
     "VerifyVerdict",
+    "COMMISSIONING_ACTIONS",
     "CommandPlan",
+    "CommissioningResult",
+    "CommissioningSession",
+    "DEFAULT_COMMISSIONING_MINUTES",
     "DryRunExecutor",
+    "HaCommissioningExecutor",
     "HaReadOnlyExecutor",
     "build_executor",
     "PriorityModeCapability",

@@ -107,8 +107,8 @@ class InverterState:
     """Everything read back from the inverter that a decision depends on.
 
     Deliberately wider than "what did we just send": ``control_authority`` is
-    the missing half of the 30100/30407 safe-state pair, without which a
-    passthrough (0/0) cannot be told from the hazardous VPP-standby state (1/0).
+    the missing half of the 30100/30407 pair, without which a passthrough (0/0)
+    cannot be told from authority held without remote control (1/0).
     """
 
     control_authority: Optional[int] = None
@@ -124,20 +124,77 @@ class InverterState:
     priority_mode: Optional[int] = None
     vpp_setpoint_mirror: Optional[int] = None
 
-    # Measured power, for EFFECT. Signs are OPPOSITE by upstream convention:
-    #   battery_power_w: positive = charging
-    #   grid_power_w:    positive = EXPORTING
+    # Measured power, for EFFECT.
+    #
+    # ``battery_power_w`` is NORMALIZED by the backend — positive = charging,
+    # negative = discharging — whatever polarity the sensor itself reports.
+    # Policy above this line never has to know the hardware convention.
     battery_power_w: Optional[float] = None
+    battery_power_raw_w: Optional[float] = None
+    # Grid flow as two ALWAYS-POSITIVE directional readings. At most one is
+    # meaningfully non-zero at a time, and no integration option can invert
+    # them, which is why these and not the signed value decide whether energy
+    # was bought or sold.
+    grid_import_power_w: Optional[float] = None
+    grid_export_power_w: Optional[float] = None
+    # Signed grid power as the integration reports it. DIAGNOSTIC ONLY: its
+    # sign flips with the integration's `invert_grid_power` option, so it must
+    # never be what decides a trade.
     grid_power_w: Optional[float] = None
     soc_percent: Optional[float] = None
 
     @property
-    def in_vpp_standby(self) -> bool:
-        """The documented hazard state: authority granted, remote control off.
+    def authority_without_remote(self) -> bool:
+        """30100=1 with 30407=0: authority granted, remote control not enabled.
 
-        Local battery logic is suspended and load is drawn from the grid.
+        Upstream documents this pair as "VPP standby" — local battery logic
+        suspended, load drawn from the grid. **That description does not match
+        this hardware.** On 2026-09-03 the reference WIT was observed at 1/0
+        while discharging 3.8 kW and exporting 2.6 kW, with SOC falling 31 % ->
+        28 %: manifestly not a suspended battery, and not load drawn from the
+        grid either.
+
+        So this is reported as a documented DISCREPANCY worth a warning, not as
+        a hazard, and nothing recovers, releases or escalates on the strength
+        of the register pair alone. What DOES still act is a failed arm of our
+        own (see ``UpstreamVppBackend._enter_arm_failed``) — there the trigger
+        is direct knowledge that this process left a command half-applied, not
+        an inference drawn from two register values.
         """
         return self.control_authority == 1 and self.remote_enabled == 0
+
+    @property
+    def external_scheduler_present(self) -> bool:
+        """30411 > 0: some other scheduler has written a TOU schedule here.
+
+        This project never writes a TOU period — not in any plan, in any mode
+        (see fact 4 in ``upstream_vpp``'s module docstring, and
+        ``test_no_plan_ever_writes_the_tou_schedule``). So a non-zero period
+        count cannot be ours, and is positive evidence of a second scheduler,
+        which is stronger than what 30100 alone supports.
+
+        Confirmed on the reference WIT on 2026-09-03: with Growatt Smart
+        Scheduling enabled the inverter held 16 periods; switching it off in
+        the Growatt dashboard zeroed 30411 and all 60 period registers, and
+        they stayed zero over the following 44 h. The schedule is Smart
+        Scheduling's, it is written and cleared by it, and nothing else here
+        authors one.
+
+        None means 30411 was not read, which is not evidence of absence — the
+        commissioning preflight refuses on the unread register rather than
+        reading this property as False.
+        """
+        return self.tou_period_count is not None and self.tou_period_count > 0
+
+    @property
+    def authority_held(self) -> bool:
+        """30100=1, whoever set it.
+
+        Not evidence of who is controlling the inverter: 30100 is a register,
+        and it has been observed set on a WIT that was running its own
+        schedule. It only means the authority is not ours to build on.
+        """
+        return self.control_authority == 1
 
     def describe(self) -> str:
         return (

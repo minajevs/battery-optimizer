@@ -158,23 +158,102 @@ writes.
 **Layering:** `DirectControl` -> `ControlBackend` -> `CommandPlan` -> `Executor`.
 The executor seam is what makes writes *structurally* impossible rather than
 merely disabled: `DryRunExecutor` performs no I/O, `HaReadOnlyExecutor` performs
-real `get_register_data` reads and **refuses** every write step. `control_mode`
-in apps.yaml picks one, and an unrecognised value falls back to `dry_run` — a
-typo must never be what grants write access to an inverter.
+real `get_register_data` reads and **refuses** every write step, and
+`HaCommissioningExecutor` writes only to a fixed register allowlist
+(30100/30407/30408/30409/30476) and refuses everything else *at the executor*,
+rather than trusting whichever plan it is handed. `control_mode` in apps.yaml
+picks one, and an unrecognised value falls back to `dry_run` — a typo must never
+be what grants write access to an inverter.
 
-**Three hardware facts the sequences rest on** (upstream `docs/controls/wit-guide.md`):
-1. Only 30100/30407 = 0/0 and 1/1 are safe. **1/0 is the VPP standby hazard** —
-   local battery logic suspended, load drawn from the grid.
+**`commissioning` mode is not "live" mode.** It can write, so
+`backend.dry_run` is False for it — which is exactly why
+`automatic_writes_allowed` is a separate question, and the one `DirectControl`
+asks before dispatching. In commissioning the optimizer plans and logs every
+slot and transmits none of them; the only writes come from
+`CommissioningSession` (`control/commissioning.py`), driven one operation at a
+time by a person via `scripts/commission.py --confirm`. Four operations exist —
+a timed HOLD at +1%, a watchdog renewal, release, and the 30476 capability
+probe (which always restores what it changed). **Run the first three, in that
+order, before the probe**: they are the minimal VPP path (30408, 30409, 30100,
+30407) and none of them touches 30476. Proving 30476 writable licenses nothing
+by itself — it is a storage register that changes the inverter's base mode, so
+it is spent only where a hypothesis needs it, which is the later grid-charge
+experiment. `build_plan` writes 30476=1 for **GRID_CHARGE alone**; HOLD and the
+discharges leave the operator's base mode as they found it. Grid charge, both discharges and
+max export are unreachable from it three times over: `send()` refuses them,
+`build_plan` raises on them, and the executor allowlist refuses the registers
+that would implement them. Every operation re-reads and reconciles the inverter
+first and refuses — transmitting nothing — when another scheduler's TOU
+schedule is loaded (30411 > 0), or the state is hazardous (1/0), externally
+owned, release-pending, degraded, or incompletely read (30411 is one of the
+registers that must have been read). `release()` is gated by none of it.
+
+**Nothing recovers from a 1/0 found on the inverter, in any mode.**
+`reconcile()` warns about the documented discrepancy and stops there — not even
+a mode that can write will act on it, because finding two registers in a
+combination we did not create is not a licence to change them. The one
+automatic recovery that remains is `_enter_arm_failed()`, and the distinction
+is the trigger: there we know from our own write results that 30100 landed and
+30407 did not, so the half-applied command is ours to undo. A 1/0 discovered on
+an inverter we have not written to is not.
+
+**`reconcile()` may not overwrite a session state that asserts our own
+authority.** `ACTIVE` and `RELEASE_PENDING` (`OWN_AUTHORITY_STATES`) are set by
+this process — after its own successful arm, and by `release()` — so they are
+the proof of ownership that distinguishes our session from
+`EXTERNAL_CONTROL_PRESENT`. Commissioning reconciles before *every* operation,
+including mid-session and mid-release, so a read that clobbered them would
+report our own half-released session as somebody else's.
+
+**Four hardware facts the sequences rest on** (upstream `docs/controls/wit-guide.md`):
+1. 30100/30407 are written as a pair; 0/0 and 1/1 are the two states this
+   project aims for. Upstream documents **1/0 as "VPP standby"** — local
+   battery logic suspended, load drawn from the grid — but the reference WIT
+   was observed at 1/0 on 2026-09-03 while discharging 3.8 kW and exporting
+   2.6 kW with SOC falling. That is an **unresolved discrepancy to warn about,
+   not a hazard to recover from**: nothing releases, rolls back or escalates on
+   the strength of the register pair alone.
 2. Write order is 30408 -> 30409 -> **30407 last**. Arming first applies a stale
    setpoint.
 3. Only 30407/30408/30409 are "Not storage" (EEPROM-safe). Everything else is
    written **only on change**.
+4. **The base TOU schedule (30411) is never written.** A timed override returns
+   to the inverter's own schedule when it expires, so clearing it is not
+   required to run a session — and that schedule is not ours. No plan,
+   including the release plan, touches 30411.
+
+   Its author is confirmed, not guessed: on 2026-09-03 the reference WIT held
+   16 periods with **Growatt Smart Scheduling** enabled; switching Smart
+   Scheduling off in the Growatt dashboard zeroed 30411 and all 60 period
+   registers (30100 and 30410 went to 0 with them), and they were still zero
+   44 h later. `scripts/read_tou_schedule.py --save`/`--diff` is how that was
+   established and is the tool for re-checking it.
+
+   That makes **30411 > 0 an interlock**, and the only *positive* evidence of
+   a second scheduler this project has: 30100=1 says merely that authority is
+   held, but a non-zero period count cannot be ours because no code path here
+   writes one. `CommissioningSession._preflight` refuses on it before it
+   refuses on 30100 (only the TOU message names what to switch off), and
+   `UpstreamVppBackend.send()` refuses every session-holding action under it —
+   the backstop that will still be there when automatic control goes live. It
+   re-reads 30411 rather than trusting a cached count, and falls back to the
+   last known value when the read drops, so an unreadable register cannot lift
+   the interlock. **PASSTHROUGH and `release()` are exempt**: an interlock that
+   could trap a session open would be worse than the hazard it guards.
 
 `30409 = 0` is *not* idle — it is "suspend forced cycle". **HOLD is +1%.**
 `30474` is a mirror of the last *commanded* setpoint, NOT applied power, so it
 can never prove the inverter is doing anything.
 
 - Actions: `grid_charge`, `discharge_to_load`, `discharge_to_grid`, `max_export`, `hold`, `passthrough`
+- **30100=1 is not evidence of anything but 30100=1.** It is not proof the
+  authority is ours, and equally not proof that something else is actively
+  controlling the inverter — this WIT has been seen holding it while running
+  its own schedule. `reconcile()` therefore reports
+  `AUTHORITY_HELD_NOT_OURS`, which names only what is known. It stays a hard
+  interlock (we never arm on top of authority we cannot account for) without
+  claiming to know who set it. Ownership comes from `OWN_AUTHORITY_STATES`,
+  which are set from our own write results and never inferred from registers.
 - Authority is acquired LATE and armed immediately; if arming fails afterwards
   the backend enters `ARM_FAILED_AUTHORITY_HELD` and schedules a rollback —
   it cannot revoke immediately, because its own successful `30100=1` stamped the
@@ -192,8 +271,44 @@ can never prove the inverter is doing anything.
   **COMMAND MIRROR** (30474 — diagnostic only, never proof), and **EFFECT**
   (measured power). EFFECT is tri-state: a grid-charge satisfied by PV surplus
   is `INDETERMINATE`, not success and not failure, and only an unambiguous
-  `FAIL` may latch a fallback. `battery_power > 0` is charging while
-  `grid_power > 0` is EXPORTING — **opposite conventions**.
+  `FAIL` escalates.
+- **Neither power sign convention may be assumed.** Battery polarity is
+  *declared* (`battery_power_direction`: `negative_is_charging` on the
+  reference WIT, confirmed against SOC movement) and normalized once in the
+  backend, so everything above it sees `positive = charging`. Validation is
+  **strict** — an unrecognised value raises at config load rather than falling
+  back, because a default that happens to match one inverter is exactly how a
+  silently inverted verdict reaches the next one. Grid direction
+  comes from the **always-positive** `grid_import_power` / `grid_export_power`
+  sensors, never from signed `grid_power`: upstream applies its
+  `invert_grid_power` option to the signed sensor but explicitly not to those
+  two, so an HA setting could otherwise turn a purchase into a sale inside
+  trading verification. Signed grid power is published in diagnostics for
+  humans and read by nothing.
+- **An ACKed command with no EFFECT releases control; it does not rewrite the
+  TOU schedule.** After `effect_failure_limit` (default 2) consecutive `FAIL`
+  verdicts **in the same action family** (`effect_family()`: the three discharge
+  actions share one, since they are one mechanism differing only in routing),
+  `DirectControl` latches degraded, releases the VPP session so the inverter
+  resumes its own local logic, and stops commanding until `clear_degraded()`.
+  Streaks are per family because a dead grid-charge and a dead discharge are two
+  faults; one shared counter would latch after one of each and blame a mechanism
+  neither showed to be broken. Missing telemetry is always `INDETERMINATE`,
+  never `FAIL` — escalation releases the session, so an unavailable sensor must
+  not be able to take the battery off the schedule. The TOU fallback for grid charging is deliberately NOT
+  implemented (`TOU_FALLBACK_ENABLED = False`): it would have to overwrite a
+  schedule this project neither authored nor can restore.
+- **30405 is a VPP-cluster cutoff, not the local floor.** It is used only to
+  downgrade an EFFECT `FAIL` to `INDETERMINATE`. The reference inverter was
+  observed discharging to 18 % under ordinary Load First operation with
+  30405=20, so it does not describe local-mode behaviour. The authoritative
+  "do not sell below here" rule is the optimizer's own `min_soc`.
+- At startup `reconcile()` never adopts an inherited session: `30100=1 /
+  30407=1` before this process armed anything is
+  `EXTERNAL_CONTROL_PRESENT`, not `ACTIVE`. The `1/0` standby hazard is always
+  reported at CRITICAL, but a rollback is only *scheduled* when the executor
+  can actually write — queueing one from a read-only process would retry a
+  write that can never land.
 - Duplicate commands within half a slot are skipped; `release_control()` reverts to `passthrough`
 - Reliability: each call passes `hass_timeout=config.set_wit_mode_timeout_seconds` (default **15**) and inspects the service response. A raised/`success=False` result is a confirmed failure (ERROR, returns False, last-sent NOT recorded so it retries next slot). A `None` result is an unconfirmed client-side timeout (WARNING, last-sent recorded to avoid schedule spam). The timeout is short *because* the None path is safe: verify-after-set catches a genuinely lost command, whereas a long timeout blocks every other callback of this app.
 - Health accounting reads `apply_mode_with_outcome`'s `ApplyOutcome`, never the boolean: `apply_mode` returns True for three outcomes the inverter never acknowledged (`DRY_RUN`, `SKIPPED_DUPLICATE`, `UNCONFIRMED_TIMEOUT`), so only `SENT` resets `_consecutive_apply_failures`, an unconfirmed timeout escalates to the same ERROR after 3 in a row (the hung-modbus case), and a duplicate skip or dry run is neutral.
