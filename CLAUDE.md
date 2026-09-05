@@ -180,11 +180,27 @@ write results, never from register values), so a one-operation-per-invocation
 CLI *cannot* renew or release a session an earlier invocation opened — the
 next process would find `30100=1` it did not set and refuse, correctly.
 Persisting ownership to disk would mean trusting a file over the hardware.
-The individual operations remain for investigating one step — a timed HOLD at
-+1%, a watchdog renewal, release, and the 30476 capability probe (which always
-restores what it changed). **HOLD and renew are confirmed by reading
+`hold` and `renew` are therefore **not offered as standalone CLI operations**
+at all — an operation that can only open a session the next process cannot
+close has no safe use. They remain as library methods because `session_test`
+is built from them, alongside release and the 30476 capability probe (which
+always restores what it changed). **HOLD and renew are confirmed by reading
 30100/30407/30409 back**; a write that did not raise is not an armed session,
 and an unverifiable one latches degraded rather than being reported as open.
+The watchdog window is validated before any write: 30408=0 is refused (that is
+a session with no watchdog, not one without a timeout) and the accepted range
+is 1-10 minutes, with the renewal delay required to fall after the 30 s write
+cooldown and inside the session it renews.
+
+**Cleanup after `session_test` obeys three rules.** It always runs (a
+`finally`, so a failure, an exception or a Ctrl-C all leave through it); it is
+persistent (a release refused because the inverter was momentarily unreadable
+schedules no timer, so the cleanup re-initiates rather than waiting on one
+that does not exist); and a timeout reports rather than abandons — exceeding
+the budget fails the test at CRITICAL but cleanup continues while
+`safe_to_stop` is False, since nothing but this process can make it True. Only
+an explicit operator force-abort (a second interrupt) stops it, and that says
+loudly what may still be armed.
 **Run the first three, in that order, before the probe**: they are the minimal VPP path (30408, 30409, 30100,
 30407) and none of them touches 30476. Proving 30476 writable licenses nothing
 by itself — it is a storage register that changes the inverter's base mode, so

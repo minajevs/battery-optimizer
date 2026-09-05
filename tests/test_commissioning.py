@@ -931,21 +931,206 @@ def test_session_test_transmits_nothing_when_the_preflight_refuses():
     assert app.writes == []
 
 
-def test_session_test_reports_a_release_that_never_confirmed():
-    """A stuck handover is this process's problem, and it says so."""
+def test_cleanup_continues_past_the_reporting_timeout():
+    """The timeout fails the test. It does not end the handover.
+
+    Nothing but this process can make safe_to_stop true, so a timer that
+    walked away from an armed inverter would be trading a late report for a
+    stranded session.
+    """
     backend, app, session = make(clean())
     session.hold(duration_minutes=5)
-    backend.clock.advance(31)
-    # The inverter accepts 30100=0 and keeps reading 1.
-    app.ignore_writes.add(REG_CONTROL_AUTHORITY)
+    waiter = make_waiter(backend, app)
 
+    # 5 s budget against a 35 s settle: the timeout is passed several polls
+    # before the disarm can even clear its cooldown.
     result = session._release_and_report(
-        "session_test", make_waiter(backend, app), 30, 5, "summary")
+        "session_test", waiter, timeout_seconds=5, poll_seconds=5,
+        summary="summary")
 
     assert result.ok is False
-    assert "did NOT reach RELEASED" in result.detail
-    assert backend.session_state is not SessionState.RELEASED
+    assert "reporting timeout" in result.detail
+    # ... and yet it saw the release all the way through.
+    assert backend.session_state is SessionState.RELEASED
+    assert backend.session_state.safe_to_stop is True
+    assert any("cleanup continues" in m and lvl == "CRITICAL"
+               for m, lvl in app.logs)
+
+
+def test_cleanup_retries_a_release_refused_by_an_unreadable_inverter():
+    """A refusal schedules no timer, so waiting would wait forever."""
+    backend, app, session = make(clean())
+    session.hold(duration_minutes=5)
+    waiter = make_waiter(backend, app)
+
+    real_reconcile = backend.reconcile
+    blind = {"left": 2}          # the first two release attempts see nothing
+
+    def sometimes_unreadable():
+        if blind["left"] > 0:
+            blind["left"] -= 1
+            return None
+        return real_reconcile()
+
+    backend.reconcile = sometimes_unreadable
+
+    result = session._release_and_report(
+        "session_test", waiter, timeout_seconds=600, poll_seconds=5,
+        summary="summary")
+
+    assert blind["left"] == 0                       # both blind reads consumed
+    refusals = [r for r in session.history
+                if r.operation == "release" and r.refused]
+    assert len(refusals) == 2
+    assert all("unreadable" in r.detail for r in refusals)
+    assert any("re-initiating" in m for m, _lvl in app.logs)
+    assert result.ok is True
+    assert backend.session_state is SessionState.RELEASED
+
+
+def test_a_force_abort_stops_cleanup_and_says_what_may_be_left_armed():
+    """The operator's escape from an unfinishable handover, and only theirs."""
+    backend, app, session = make(clean())
+    session.hold(duration_minutes=5)
+    app.ignore_writes.add(REG_CONTROL_AUTHORITY)    # 30100 will keep reading 1
+    waiter = make_waiter(backend, app)
+    polls = {"n": 0}
+
+    def wait(seconds):
+        polls["n"] += 1
+        if polls["n"] > 3:
+            raise KeyboardInterrupt                 # the second interrupt
+        waiter(seconds)
+
+    result = session._release_and_report(
+        "session_test", wait, timeout_seconds=5, poll_seconds=5,
+        summary="summary")
+
+    assert result.ok is False
+    assert "FORCE-ABORTED" in result.detail
     assert backend.session_state.safe_to_stop is False
+    assert any("FORCE-ABORT" in m and lvl == "CRITICAL"
+               for m, lvl in app.logs)
+
+
+def test_an_interrupt_after_the_hold_still_hands_the_inverter_back():
+    """Ctrl-C mid-experiment is an operator changing their mind, not a leak."""
+    backend, app, session = make(clean())
+    waiter = make_waiter(backend, app)
+    interrupted = {"done": False}
+
+    def wait(seconds):
+        if not interrupted["done"]:
+            interrupted["done"] = True
+            raise KeyboardInterrupt                 # during the renewal wait
+        waiter(seconds)
+
+    result = session.session_test(wait=wait, duration_minutes=5,
+                                  renew_after_seconds=35)
+
+    assert result.ok is False
+    assert "ABORTED by KeyboardInterrupt" in result.detail
+    # The session that was open is closed, and confirmed closed.
+    assert backend.session_state is SessionState.RELEASED
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+    assert app.registers[REG_REMOTE_ENABLE] == 0
+
+
+def test_an_error_after_the_hold_still_hands_the_inverter_back():
+    backend, app, session = make(clean())
+    waiter = make_waiter(backend, app)
+    raised = {"done": False}
+
+    def wait(seconds):
+        if not raised["done"]:
+            raised["done"] = True
+            raise RuntimeError("the network went away")
+        waiter(seconds)
+
+    result = session.session_test(wait=wait, duration_minutes=5,
+                                  renew_after_seconds=35)
+
+    assert result.ok is False
+    assert "ABORTED by RuntimeError" in result.detail
+    assert backend.session_state is SessionState.RELEASED
+    assert app.registers[REG_CONTROL_AUTHORITY] == 0
+
+
+# ---------------------------------------------------------------------------
+# Duration and renewal-timing validation
+# ---------------------------------------------------------------------------
+
+def test_a_zero_duration_hold_is_refused_because_it_has_no_watchdog():
+    """30408=0 is not "no timeout"; it is a session nothing will ever end."""
+    _backend, app, session = make(clean())
+
+    result = session.hold(duration_minutes=0)
+
+    assert result.refused is True
+    assert "NO WATCHDOG" in result.detail
+    assert app.writes == []
+
+
+@pytest.mark.parametrize("minutes", [-5, 0, 11, 60, 1440])
+def test_durations_outside_the_commissioning_range_are_refused(minutes):
+    _backend, app, session = make(clean())
+
+    assert session.hold(duration_minutes=minutes).refused is True
+    assert session.session_test(
+        wait=lambda s: None, duration_minutes=minutes).refused is True
+    assert app.writes == []
+
+
+@pytest.mark.parametrize("minutes", [1, 5, 10])
+def test_the_bounded_range_itself_is_accepted(minutes):
+    _backend, app, session = make(clean())
+
+    result = session.hold(duration_minutes=minutes)
+
+    assert result.ok is True
+    assert (REG_REMOTE_DURATION, minutes) in app.writes
+
+
+def test_a_non_integer_duration_is_refused_before_any_write():
+    _backend, app, session = make(clean())
+
+    assert session.hold(duration_minutes=2.5).refused is True
+    assert session.hold(duration_minutes=True).refused is True
+    assert app.writes == []
+
+
+def test_a_renewal_inside_the_write_cooldown_is_refused():
+    """It would measure the cooldown, not the watchdog."""
+    _backend, app, session = make(clean())
+
+    result = session.session_test(
+        wait=lambda s: None, duration_minutes=5, renew_after_seconds=20)
+
+    assert result.refused is True
+    assert "cooldown" in result.detail
+    assert app.writes == []
+
+
+def test_a_renewal_after_the_session_would_have_expired_is_refused():
+    _backend, app, session = make(clean())
+
+    result = session.session_test(
+        wait=lambda s: None, duration_minutes=1, renew_after_seconds=90)
+
+    assert result.refused is True
+    assert "already have expired" in result.detail
+    assert app.writes == []
+
+
+def test_renewal_timing_is_validated_before_a_session_is_opened():
+    """Refusals must not be the thing that leaves an inverter armed."""
+    backend, app, session = make(clean())
+
+    session.session_test(wait=lambda s: None, duration_minutes=5,
+                         renew_after_seconds=5)
+
+    assert app.writes == []
+    assert backend.session_state is SessionState.NOT_ARMED
 
 
 def test_a_second_process_cannot_take_over_a_session_it_did_not_open():

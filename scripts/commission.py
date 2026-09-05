@@ -13,25 +13,35 @@ anywhere near it.
 `state` is read-only and needs no --confirm. The others write:
 
     session-test  HOLD -> timed renewal experiment -> RELEASE, start to
-                  finish in this one process. THE ONE TO RUN FIRST.
-    hold          open a timed VPP session at +1 %
-    renew         re-arm the watchdog on the session THIS process opened
+                  finish in this one process. THE ONLY WAY TO OPEN A SESSION.
     release       give the inverter back to its own local logic
     probe         write 30476 to a different value, read it back, restore it
 
-**Use `session-test`.** Ownership of a VPP session is process-local on
-purpose: it comes from this process's own successful writes and is never
-reconstructed from register values, because a register cannot tell you who
-wrote it. So a `hold` in one invocation CANNOT be renewed or released by the
-next one — that invocation would find 30100=1 it did not set, and refuse. The
-separate `hold` / `renew` / `release` operations remain for investigating a
-single step; `session-test` is what actually exercises the lifecycle.
+**There is deliberately no standalone `hold` or `renew`.** Ownership of a VPP
+session is process-local: it comes from this process's own successful writes
+and is never reconstructed from register values, because a register cannot
+tell you who wrote it. A `hold` in one invocation therefore CANNOT be renewed
+or released by the next one — that invocation would find 30100=1 it did not
+set and refuse, correctly, leaving an armed session that only a watchdog
+expiry could end. An operation that can only ever open a session it cannot
+close has no safe use, so it is not offered.
 
-It stays alive through the whole release: RELEASED requires BOTH halves
-confirmed by read-back — 30100=0, then the delayed 30407=0 — and the timers
-that finish it exist only while this process does. Do not interrupt it. If it
-is killed anyway, the timed override expires on its own and the inverter
-returns to its base mode; that is why the hold is only minutes long.
+`session-test` opens and closes the session in one process. It stays alive
+through the whole release: RELEASED requires BOTH halves confirmed by
+read-back — 30100=0, then the delayed 30407=0 — and the timers that finish it
+exist only while this process does.
+
+**Interrupting it:** one Ctrl-C aborts the experiment and hands the inverter
+back; the process stays alive through that cleanup. A second Ctrl-C during
+cleanup force-aborts and may leave the inverter armed — it says so, loudly,
+and `--operation state` is how you check. A reporting timeout marks the test
+failed but never ends the cleanup on its own. If the process is killed
+outright, the timed override expires by itself and the inverter returns to
+its base mode; that is what the bounded 1-10 minute duration is for.
+
+`release` remains for the aftermath of exactly that: it refuses to revoke
+authority this process did not take, so it is a safe thing to try and a
+useless thing to rely on.
 
 Run hold -> renew -> release first, in that order. Those three are the minimal
 VPP path (30408, 30409, 30100, 30407) and none of them touches 30476. `probe`
@@ -47,8 +57,7 @@ count is not ours. Check with `--operation state`, and switch the external
 scheduler off before commissioning. `release` is exempt: handing the inverter
 back is never blocked.
 
-`hold` and `renew` open a session that only THIS process can close. Revoking
-authority is rate-limited for 30 s by the very write that took it, so
+Revoking authority is rate-limited for 30 s by the very write that took it, so
 `release` reports "in progress" and schedules its own retry; because a one-shot
 CLI exits, --wait-for-release holds the process open until both halves read
 back. It defaults to 120 s for exactly that reason.
@@ -75,8 +84,14 @@ from battery_optimizer_lib.control import (                             # noqa: 
     UpstreamVppBackend,
     build_executor,
 )
+from battery_optimizer_lib.control.commissioning import (               # noqa: E402
+    MAX_COMMISSIONING_MINUTES,
+    MIN_COMMISSIONING_MINUTES,
+)
 
-WRITING_OPERATIONS = ("session-test", "probe", "hold", "renew", "release")
+# No "hold" and no "renew": see the module docstring. An operation that can
+# only open a session this process cannot close is not offered at all.
+WRITING_OPERATIONS = ("session-test", "probe", "release")
 
 
 class RestApp:
@@ -203,7 +218,11 @@ def main() -> int:
     parser.add_argument("--device-id", required=True)
     parser.add_argument("--operation", required=True,
                         choices=("state",) + WRITING_OPERATIONS)
-    parser.add_argument("--duration-minutes", type=int, default=5)
+    parser.add_argument("--duration-minutes", type=int, default=5,
+                        help=f"watchdog window for the session "
+                             f"({MIN_COMMISSIONING_MINUTES}-"
+                             f"{MAX_COMMISSIONING_MINUTES} min; 0 is refused — "
+                             f"it is a session with no watchdog)")
     parser.add_argument("--confirm", action="store_true",
                         help="required for any operation that writes")
     parser.add_argument("--wait-for-release", type=int, default=120,
@@ -260,10 +279,6 @@ def main() -> int:
         )
     elif args.operation == "probe":
         result = session.probe_priority_mode()
-    elif args.operation == "hold":
-        result = session.hold(duration_minutes=args.duration_minutes)
-    elif args.operation == "renew":
-        result = session.renew(duration_minutes=args.duration_minutes)
     else:
         result = session.release()
 

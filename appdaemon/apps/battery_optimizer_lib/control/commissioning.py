@@ -29,6 +29,28 @@ and it is what the first hardware run must establish on its own. None of the
 three touches 30476. ``hold()`` and ``renew()`` are confirmed by reading
 30100/30407/30409 back: a write that did not raise is not an armed session.
 
+``hold`` and ``renew`` are NOT offered as standalone CLI operations, for the
+same reason: an operation that can only open a session the next process
+cannot close has no safe use. They remain here because ``session_test`` is
+built from them.
+
+Three rules govern the cleanup, and they are the reason this is safe to run
+against real hardware:
+
+* **It always runs.** Whatever leaves the experiment — a failure, an
+  exception, a KeyboardInterrupt — leaves it through the same ``finally``.
+* **It is persistent.** A release refused because the inverter was momentarily
+  unreadable schedules no retry timer, so waiting would wait forever; the
+  cleanup re-initiates instead of waiting on a timer that does not exist.
+* **A timeout reports, it does not abandon.** Exceeding the budget marks the
+  test failed and says so at CRITICAL, but cleanup continues while
+  ``safe_to_stop`` is False, because nothing but this process can make it
+  True. Only an explicit operator force-abort (a second interrupt) stops it.
+
+The watchdog window is validated before anything is written: 30408=0 is not
+"no timeout" but a session nothing would ever end, and the accepted range is
+``MIN_COMMISSIONING_MINUTES``..``MAX_COMMISSIONING_MINUTES``.
+
 ``probe_priority_mode()`` is deliberately NOT part of it. It is a supervised
 capability probe, and its result licenses nothing by itself: knowing that
 30476 can be written is not a reason to write it. 30476 is a storage register
@@ -62,12 +84,23 @@ from typing import Any, List, Optional, Tuple
 
 from .actions import ControlAction
 from .backend import InverterCommand, InverterState, SendResult
-from .upstream_vpp import HOLD_POWER_PERCENT, SessionState
+from .upstream_vpp import HOLD_POWER_PERCENT, SessionState, UNFINISHED_STATES
 
 # Short by design. A commissioning HOLD should expire on its own well inside
 # the operator's attention span, so a forgotten session self-heals via the
 # inverter's watchdog rather than persisting.
 DEFAULT_COMMISSIONING_MINUTES = 5
+
+# 30408 is the watchdog window, and it is the only thing that returns the
+# inverter to its base mode if this process dies mid-session. Both ends are
+# enforced, not advisory:
+#
+#   0 is NOT "no timeout" -- it is a session with no watchdog at all, exactly
+#     the state a supervised operation must never be able to create.
+#   10 minutes is the upper bound because a commissioning session should
+#     expire well inside the operator's attention span.
+MIN_COMMISSIONING_MINUTES = 1
+MAX_COMMISSIONING_MINUTES = 10
 
 # The renewal experiment must re-arm AFTER the per-register write cooldown has
 # expired, or it measures the cooldown instead of the watchdog.
@@ -237,6 +270,74 @@ class CommissioningSession:
 
         return state, None
 
+    # --- input validation -------------------------------------------------
+
+    def _validate_duration(
+        self, operation: str, duration_minutes
+    ) -> Optional[CommissioningResult]:
+        """Refuse an unusable watchdog window before touching the inverter.
+
+        Returns a refusal, or None when the value is fit to write. Checked
+        here rather than at the CLI because the library is what actually
+        writes 30408, and a caller that skipped the CLI would otherwise skip
+        the check with it.
+        """
+        if isinstance(duration_minutes, bool) or not isinstance(
+                duration_minutes, int):
+            return self._refuse(
+                operation,
+                f"duration must be a whole number of minutes, got "
+                f"{duration_minutes!r}")
+
+        if duration_minutes < MIN_COMMISSIONING_MINUTES:
+            return self._refuse(
+                operation,
+                f"duration {duration_minutes} min would write 30408="
+                f"{duration_minutes}. That is not 'no timeout', it is a "
+                f"session with NO WATCHDOG: nothing would return the inverter "
+                f"to its base mode if this process died holding it. Minimum "
+                f"is {MIN_COMMISSIONING_MINUTES} min")
+
+        if duration_minutes > MAX_COMMISSIONING_MINUTES:
+            return self._refuse(
+                operation,
+                f"duration {duration_minutes} min exceeds the commissioning "
+                f"maximum of {MAX_COMMISSIONING_MINUTES} min. A supervised "
+                f"session must expire inside the operator's attention span")
+
+        return None
+
+    def _validate_renewal_timing(
+        self, operation: str, duration_minutes: int, renew_after_seconds
+    ) -> Optional[CommissioningResult]:
+        """The renewal must land after the cooldown and inside the window."""
+        cooldown = int(getattr(self.backend.cooldown, "cooldown_seconds", 30))
+
+        if not isinstance(renew_after_seconds, int) or isinstance(
+                renew_after_seconds, bool):
+            return self._refuse(
+                operation,
+                f"renewal delay must be a whole number of seconds, got "
+                f"{renew_after_seconds!r}")
+
+        if renew_after_seconds <= cooldown:
+            return self._refuse(
+                operation,
+                f"renewal delay {renew_after_seconds}s is inside the {cooldown}s "
+                f"per-register write cooldown, so the re-arm would be refused "
+                f"by the cooldown and the experiment would measure that "
+                f"instead of the watchdog")
+
+        window = duration_minutes * 60
+        if renew_after_seconds >= window:
+            return self._refuse(
+                operation,
+                f"renewal delay {renew_after_seconds}s is not inside the "
+                f"{window}s session it is meant to renew: the override would "
+                f"already have expired")
+
+        return None
+
     # --- the four operations ---------------------------------------------
 
     def probe_priority_mode(self) -> CommissioningResult:
@@ -269,6 +370,9 @@ class CommissioningSession:
         essentially nothing.
         """
         operation = "timed_hold"
+        invalid = self._validate_duration(operation, duration_minutes)
+        if invalid is not None:
+            return invalid
         state, refusal = self._preflight(operation)
         if refusal is not None:
             return refusal
@@ -284,6 +388,9 @@ class CommissioningSession:
         operation that finds out whether that is true.
         """
         operation = "timer_renewal"
+        invalid = self._validate_duration(operation, duration_minutes)
+        if invalid is not None:
+            return invalid
         state, refusal = self._preflight(operation, require_active=True)
         if refusal is not None:
             return refusal
@@ -485,6 +592,14 @@ class CommissioningSession:
         operation = "session_test"
         self.observations = []
 
+        invalid = self._validate_duration(operation, duration_minutes)
+        if invalid is not None:
+            return invalid
+        invalid = self._validate_renewal_timing(
+            operation, duration_minutes, renew_after_seconds)
+        if invalid is not None:
+            return invalid
+
         opened = self.hold(duration_minutes=duration_minutes)
         if opened.refused:
             # Nothing was transmitted, so there is nothing to hand back.
@@ -499,24 +614,41 @@ class CommissioningSession:
                 f"inverter back without attempting the renewal",
                 steps_ok=False)
 
-        after_open = self._observe("after HOLD")
+        # From here a session is OPEN, so every path out of this block ends in
+        # the same cleanup -- including the ones nobody planned for. A
+        # KeyboardInterrupt during the experiment is an operator changing
+        # their mind, and it must hand the inverter back rather than abandon
+        # an armed session at the shell prompt.
+        summary = "no renewal verdict"
+        steps_ok = False
+        try:
+            after_open = self._observe("after HOLD")
 
-        wait(renew_after_seconds)
-        after_wait = self._observe(f"after {renew_after_seconds}s of session")
+            wait(renew_after_seconds)
+            after_wait = self._observe(
+                f"after {renew_after_seconds}s of session")
 
-        renewed = self.renew(duration_minutes=duration_minutes)
-        after_renew = self._observe("after RENEW")
+            renewed = self.renew(duration_minutes=duration_minutes)
+            after_renew = self._observe("after RENEW")
 
-        verdict = self._renewal_verdict(
-            after_open, after_wait, after_renew, duration_minutes)
-        if not renewed.ok:
-            verdict = f"renew operation did not confirm ({renewed.detail})"
-        self.observations.append(verdict)
-        self._log(verdict)
+            summary = self._renewal_verdict(
+                after_open, after_wait, after_renew, duration_minutes)
+            if not renewed.ok:
+                summary = f"renew operation did not confirm ({renewed.detail})"
+            steps_ok = renewed.ok
+            self.observations.append(summary)
+            self._log(summary)
+        except BaseException as exc:   # noqa: BLE001 - KeyboardInterrupt too
+            summary = (f"ABORTED by {type(exc).__name__}: {exc}. A session was "
+                       f"open, so it is being handed back before this returns")
+            steps_ok = False
+            self._log(summary, level="ERROR")
+        finally:
+            result = self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                summary, steps_ok=steps_ok)
 
-        return self._release_and_report(
-            operation, wait, release_timeout_seconds, poll_seconds, verdict,
-            steps_ok=renewed.ok)
+        return result
 
     def _release_and_report(
         self, operation: str, wait, timeout_seconds: int, poll_seconds: int,
@@ -532,29 +664,86 @@ class CommissioningSession:
         does not redeem a hold that never armed, so a successful release is
         reported as a successful RELEASE, not a successful test.
         """
-        released = self.release()
-        remaining = int(timeout_seconds)
+        elapsed = 0
+        timed_out = False
+        forced = False
+        last = self.release()
 
-        while (self.backend.session_state is not SessionState.RELEASED
-               and remaining > 0):
-            wait(poll_seconds)
-            remaining -= poll_seconds
+        # The loop is governed by safe_to_stop, NOT by the timeout. Exceeding
+        # the timeout is a REPORTING event: it makes the test a failure and
+        # says so loudly, and cleanup carries on regardless, because the only
+        # thing that can finish a handover is this process. The operator's
+        # escape is an explicit force-abort (a second interrupt), never a
+        # timer deciding on its own to walk away from an armed inverter.
+        while not self.backend.session_state.safe_to_stop:
+            session = self.backend.session_state
+
+            if session not in UNFINISHED_STATES:
+                # Nothing is in flight: the last attempt was REFUSED, so no
+                # retry timer exists and waiting would wait forever. The
+                # commonest cause is a momentarily unreadable inverter, which
+                # makes the release preflight refuse to act blind -- transient,
+                # and answered by asking again rather than by giving up.
+                self._log(
+                    f"release has not started (session_state={session.value}: "
+                    f"{last.detail}); re-initiating rather than waiting on a "
+                    f"timer that was never scheduled",
+                    level="WARNING",
+                )
+                last = self.release()
+
+            try:
+                wait(poll_seconds)
+            except KeyboardInterrupt:
+                forced = True
+                self._log(
+                    "FORCE-ABORT during cleanup. The inverter may still hold "
+                    "an armed session that only this process could close — "
+                    "check 30100/30407 by hand NOW "
+                    "(scripts/commission.py --operation state).",
+                    level="CRITICAL",
+                )
+                break
+
+            elapsed += poll_seconds
+            if elapsed >= timeout_seconds and not timed_out:
+                timed_out = True
+                self._log(
+                    f"release has not confirmed within {timeout_seconds}s. "
+                    f"The TEST is a failure from here, but cleanup continues: "
+                    f"safe_to_stop is False and nothing but this process can "
+                    f"make it True. Interrupt again to force-abort.",
+                    level="CRITICAL",
+                )
 
         self._observe("after RELEASE")
         final = self.backend.session_state
 
-        if final is SessionState.RELEASED:
+        if forced:
             return self._record(CommissioningResult(
-                operation=operation, ok=steps_ok,
-                detail=f"{summary}; released and confirmed "
-                       f"(30100=0 and 30407=0 both read back)"))
+                operation=operation, ok=False,
+                detail=f"{summary}; cleanup FORCE-ABORTED by the operator at "
+                       f"session_state={final.value} "
+                       f"(safe_to_stop={final.safe_to_stop}). Verify "
+                       f"30100/30407 by hand"))
 
+        if final is SessionState.RELEASED:
+            detail = (f"{summary}; released and confirmed "
+                      f"(30100=0 and 30407=0 both read back)")
+            if timed_out:
+                detail = (f"{detail} — but only after the {timeout_seconds}s "
+                          f"reporting timeout had passed")
+            return self._record(CommissioningResult(
+                operation=operation, ok=steps_ok and not timed_out,
+                detail=detail))
+
+        # safe_to_stop without RELEASED: nothing of ours is outstanding (the
+        # authority turned out not to be ours to revoke, or was never taken).
         return self._record(CommissioningResult(
             operation=operation, ok=False,
-            detail=f"{summary}; the session did NOT reach RELEASED within "
-                   f"{timeout_seconds}s (session_state={final.value}, "
-                   f"release returned {released.detail}). This process still "
-                   f"owns the handover — do not stop it; investigate now"))
+            detail=f"{summary}; ended at session_state={final.value} rather "
+                   f"than released ({last.detail}). Nothing of this process's "
+                   f"is left outstanding, but verify the inverter by hand"))
 
     # --- reporting --------------------------------------------------------
 
