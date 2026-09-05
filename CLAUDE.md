@@ -222,6 +222,34 @@ A recovering process also adopts the 30100 write timestamp from the lease: the
 inverter's 30 s cooldown does not reset because the process that stamped it
 died, and without that the release is refused repeatedly before it lands.
 
+**The second safety layer is `appdaemon/apps/session_reaper.py`.** The lease
+fixes a strand at the next start; it does not fix one while the process stays
+down. So the optimizer stamps a heartbeat on a timer (`heartbeat_path`,
+`heartbeat_seconds`) and a SEPARATE AppDaemon app watches it go stale — on a
+timer rather than from the slot callbacks, because a heartbeat that only ticks
+when work happens cannot tell "idle" from "wedged". Reaping requires a stale
+heartbeat AND a lease AND that lease naming this device AND 30100=1 AND 30407=1
+AND 30411=0 AND 30409 still holding the recorded setpoint; none of those is
+sufficient alone, and the last two are refusals rather than reasons — a
+schedule that appeared or a setpoint that changed means something touched the
+inverter after our session, which is reported loudly and left alone. It can
+only release: the decision logic (`control/reaper.py`) hands off to the same
+`recover()`, which refuses unless the backend independently reached
+`RECOVERABLE_LEASE`, and a test asserts the only registers it can ever write
+are 30100 and 30407, only to 0. Status goes to
+`sensor.battery_session_reaper` (verdict, last_reap, reap_count, reap_failed).
+
+Proved on hardware 2026-09-05: five consecutive refusals at 16/37/53/70/86 s
+with an armed session and a matching lease in front of it, then a reap at 102 s
+that released, confirmed both halves and closed the lease. `scripts/reap.py`
+runs the same library code over the REST shim, which is how that was done
+without deploying to AppDaemon.
+
+**Its independence has a boundary.** It is independent of the optimizer *app*,
+not of AppDaemon. If the add-on dies, both die and the inverter stays armed
+until AppDaemon returns. A watcher outside AppDaemon is the remaining piece,
+and is a prerequisite for unattended energetic control.
+
 **Cleanup after `session_test` obeys three rules.** It always runs (a
 `finally`, so a failure, an exception or a Ctrl-C all leave through it); it is
 persistent (a release refused because the inverter was momentarily unreadable
