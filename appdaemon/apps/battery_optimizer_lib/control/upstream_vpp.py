@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .actions import ControlAction
+from .lease import ACTIVE as LEASE_ACTIVE, SessionLease
 from .backend import (
     EffectVerdict,
     InverterCommand,
@@ -97,17 +98,25 @@ TOU_FALLBACK_ENABLED = False
 
 # The only actions commissioning mode will transmit. Everything that moves
 # energy for money -- grid charge, either discharge, max export -- is excluded:
-# commissioning proves the SESSION machinery (take authority, arm, renew the
-# watchdog, release) and nothing else. HOLD is the least energetic way to do
-# that, because +1 % keeps a session alive while moving almost no power.
+# commissioning proves the SESSION machinery (take authority, arm, rewrite the
+# duration, release) and nothing else. HOLD is the least energetic way to do
+# that: +1 % keeps a session alive while moving ~100-150 W into the battery and
+# putting the house load on the grid -- small, but not nothing.
 COMMISSIONING_ACTIONS = frozenset({
     ControlAction.HOLD,
     ControlAction.PASSTHROUGH,
 })
 
 # 30409 value that means "hold". NOT 0 — that is documented as "suspend forced
-# cycle (passthrough)", and 0 was observed clipping PV. +1% keeps the VPP
-# session active while charging nothing meaningful.
+# cycle (passthrough)", and 0 was observed clipping PV.
+#
+# It is a LITERAL SMALL CHARGE REQUEST, not a neutral sentinel. Measured on the
+# reference WIT (2026-09-05): battery discharge stopped and turned to roughly
+# 100-150 W of charge, with the house load transferred to the grid (~390 W
+# imported), reverting within seconds of the release. That is the wanted
+# behaviour for a reserve/HOLD — the battery stops serving the house — but it
+# is bought by importing, and anything reasoning about cost must treat it as a
+# small purchase rather than as nothing happening.
 HOLD_POWER_PERCENT = 1
 
 
@@ -183,6 +192,13 @@ class SessionState(enum.Enum):
     # hard interlock — we never arm on top of authority we cannot account for —
     # without pretending to know who set it or why.
     AUTHORITY_HELD_NOT_OURS = "authority_held_not_ours"
+    # 30100=1 found WITH a durable lease from a previous instance of this
+    # process, so the evidence that it is ours is our own record rather than an
+    # inference from the register. It grants ONE permission: release. Never
+    # resume, never re-arm, never promote to ACTIVE -- a file cannot say what a
+    # register means, only that we started something and have no record of
+    # finishing it. See control/lease.py.
+    RECOVERABLE_LEASE = "recoverable_lease"
 
     @property
     def safe_to_stop(self) -> bool:
@@ -196,6 +212,11 @@ class SessionState(enum.Enum):
         inverter, but the scheduled 30407=0 has not run, and stopping the
         process kills the only thing that will ever run it -- leaving the
         inverter armed for a session nobody owns.
+
+        RECOVERABLE_LEASE is NOT safe either, and it is the one state where
+        that verdict is about a session THIS process never opened: a previous
+        instance left one armed, this one has the evidence, and there is no
+        hardware expiry coming to end it. Stopping here abandons it again.
         """
         return self in (SessionState.NOT_ARMED, SessionState.RELEASED,
                         SessionState.AUTHORITY_HELD_NOT_OURS)
@@ -210,6 +231,11 @@ OWN_AUTHORITY_STATES = frozenset({
     # We took the authority and could not arm it. Ours, and known to be ours
     # from our own write result rather than from what the registers now read.
     SessionState.ARM_FAILED_AUTHORITY_HELD,
+    # A stranded session this process has durable evidence for. In this set so
+    # that a re-read cannot quietly downgrade it to AUTHORITY_HELD_NOT_OURS and
+    # strand it again -- NOT because it may act like the others. Every write
+    # path checks it separately and refuses everything except the release.
+    SessionState.RECOVERABLE_LEASE,
 })
 
 # States in which this process still has unfinished business with the inverter
@@ -419,7 +445,7 @@ class HaCommissioningExecutor(_HaRegisterReader):
     WRITABLE_REGISTERS = frozenset({
         REG_CONTROL_AUTHORITY,   # 30100 — take/release authority
         REG_REMOTE_ENABLE,       # 30407 — arm/disarm
-        REG_REMOTE_DURATION,     # 30408 — watchdog duration
+        REG_REMOTE_DURATION,     # 30408 — duration field (NOT enforced; see below)
         REG_REMOTE_POWER,        # 30409 — signed setpoint (+1 % HOLD only)
         REG_PRIORITY_MODE,       # 30476 — capability probe, always restored
     })
@@ -518,9 +544,17 @@ class UpstreamVppBackend:
 
     name = "upstream_vpp"
 
-    def __init__(self, app, config, executor=None, clock: Optional[Callable] = None):
+    def __init__(self, app, config, executor=None, clock: Optional[Callable] = None,
+                 lease=None):
         self.app = app
         self.config = config
+        # Durable record of an unfinished session. None disables persistence,
+        # which is what every dry-run and read-only caller gets: a backend that
+        # cannot write cannot strand anything.
+        self.lease = lease if lease is not None else SessionLease(
+            getattr(config, "session_lease_path", None),
+            log_func=getattr(app, "log", None))
+        self._lease_record = None
         self.executor = executor or DryRunExecutor(getattr(app, "log", None))
         self.cooldown = CooldownTracker(
             int(getattr(config, "wit_cooldown_seconds", WIT_COOLDOWN_SECONDS)),
@@ -560,6 +594,8 @@ class UpstreamVppBackend:
             "disarm_confirmed": 0,
             "external_scheduler_refusals": 0,
             "authority_not_ours_refusals": 0,
+            "stranded_session_refusals": 0,
+            "leases_recovered": 0,
         }
 
     # --- configuration helpers -------------------------------------------
@@ -756,7 +792,7 @@ class UpstreamVppBackend:
 
         # 2. Timed override. Both EEPROM-safe, rewritten every slot.
         plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
-                               note="duration (watchdog)"))
+                               note="duration (not enforced)"))
         plan.add(RegisterWrite(REG_REMOTE_POWER, self._power_target(command),
                                note="signed power target"))
 
@@ -793,7 +829,7 @@ class UpstreamVppBackend:
         plan = CommandPlan(action=command.action)
 
         plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
-                               note="duration (watchdog)"))
+                               note="duration (not enforced)"))
         plan.add(RegisterWrite(REG_REMOTE_POWER, self._power_target(command),
                                note="signed power target"))
 
@@ -872,6 +908,18 @@ class UpstreamVppBackend:
         # Only reconcile() sets this state, and only from a read, so it never
         # fires on authority this process took.
         if (command.action.holds_session and not self.dry_run
+                and self.session_state is SessionState.RECOVERABLE_LEASE):
+            self._counters["stranded_session_refusals"] += 1
+            self._log(
+                f"REFUSED {command.action.value}: a stranded session from a "
+                f"previous instance is still armed on this inverter. The only "
+                f"permitted action is releasing it — recovery never resumes a "
+                f"session and never arms on top of one. Nothing was sent.",
+                level="ERROR",
+            )
+            return SendResult.FAILED
+
+        if (command.action.holds_session and not self.dry_run
                 and self.session_state is SessionState.AUTHORITY_HELD_NOT_OURS):
             self._counters["authority_not_ours_refusals"] += 1
             self._log(
@@ -925,7 +973,24 @@ class UpstreamVppBackend:
         for line in plan.describe():
             self._log(f"    {line}", level="DEBUG")
 
-        return self._execute_plan(plan)
+        # BEFORE the first write, never after: a crash between the lease and
+        # the authority write leaves a lease with nothing to clean up, which
+        # recovery detects from the registers and discards. The other order
+        # would leave authority taken with no record of it -- the exact failure
+        # the lease exists to prevent.
+        if command.action.holds_session and self._lease_record is None:
+            self._lease_record = self.lease.open(
+                device_id=str(getattr(self.config, "device_id", "")),
+                action=command.action.value,
+                setpoint_percent=command.power_percent,
+                duration_minutes=command.duration_minutes)
+
+        result = self._execute_plan(plan)
+
+        if result is SendResult.CONFIRMED and command.action.holds_session:
+            self._lease_record = self.lease.mark(self._lease_record, LEASE_ACTIVE)
+
+        return result
 
     def _log_decision(self, command: InverterCommand, plan: CommandPlan) -> None:
         """Log actual inverter state -> desired action -> proposed sequence.
@@ -1178,6 +1243,7 @@ class UpstreamVppBackend:
             self.session_state = SessionState.RELEASED
             self._log("authority released and 30407 already 0 — RELEASED "
                       "(both halves confirmed by read-back)")
+            self._close_lease()
             return SendResult.CONFIRMED
 
         self.session_state = SessionState.RELEASE_SETTLING
@@ -1255,6 +1321,7 @@ class UpstreamVppBackend:
         self.session_state = SessionState.RELEASED
         self._log("disarm confirmed by read-back (30407=0) — RELEASED; "
                   "both halves of the release are now confirmed")
+        self._close_lease()
 
     # --- startup reconciliation -------------------------------------------
 
@@ -1360,8 +1427,91 @@ class UpstreamVppBackend:
                 level="WARNING",
             )
 
+        self._reconcile_lease(state)
+
         self._log(f"reconciled with inverter: {state.describe()}")
         return state
+
+    # --- durable recovery of a session this process did not open -----------
+
+    def _close_lease(self) -> None:
+        """Both halves of the release are confirmed: nothing is outstanding."""
+        self.lease.close()
+        self._lease_record = None
+
+    def _reconcile_lease(self, state: InverterState) -> None:
+        """Consult the durable lease about authority we did not just take.
+
+        This runs AFTER the ownership branch above, so the register-only
+        verdict is reached first and this can only ever move it in one
+        direction: from "not ours, do not touch" to "ours to CLEAN UP". It
+        never promotes anything to ACTIVE, and without a lease nothing changes
+        at all.
+        """
+        if self._lease_record is not None:
+            # This process's own session, already accounted for in memory.
+            return
+
+        record = self.lease.read()
+        if record is None:
+            return
+
+        if not state.authority_held:
+            # A lease with nothing stranded behind it: the previous instance
+            # got as far as writing the lease and no further, or its release
+            # landed and only the unlink was lost. Either way the inverter is
+            # already back to its own logic, and keeping the file would make
+            # the next start believe there is something to recover.
+            if state.remote_enabled in (0, None):
+                self._log(
+                    f"discarding a stale lease ({record.describe()}): the "
+                    f"inverter reads 30100=0/30407={state.remote_enabled}, so "
+                    f"nothing of that session is still applied")
+                self.lease.close()
+            return
+
+        expected_device = str(getattr(self.config, "device_id", ""))
+        if record.device_id != expected_device:
+            self._log(
+                f"a lease exists but it names device {record.device_id}, not "
+                f"{expected_device}. NOT adopted — recovery acts only on the "
+                f"inverter the record names",
+                level="ERROR")
+            return
+
+        if state.external_scheduler_present:
+            self._log(
+                f"a lease exists for this device, but 30411 reports "
+                f"{state.tou_period_count} TOU period(s) — another scheduler "
+                f"is loaded. NOT adopted: releasing here would hand the "
+                f"inverter to a schedule nobody in this process chose. Clear "
+                f"the external scheduler, then re-run recovery",
+                level="ERROR")
+            return
+
+        if (record.setpoint_percent is not None
+                and state.commanded_power is not None
+                and state.commanded_power != record.setpoint_percent):
+            self._log(
+                f"a lease exists for this device, but 30409 reads "
+                f"{state.commanded_power} where the record says "
+                f"{record.setpoint_percent}. Something re-commanded this "
+                f"inverter after our session, so the armed session is NOT the "
+                f"one recorded. NOT adopted — establish what changed it",
+                level="ERROR")
+            return
+
+        self.session_state = SessionState.RECOVERABLE_LEASE
+        self._lease_record = record
+        self._counters["leases_recovered"] += 1
+        self._log(
+            f"STRANDED SESSION RECOVERED: {record.describe()}. The inverter "
+            f"reads 30100={state.control_authority}/"
+            f"30407={state.remote_enabled} and there is no hardware expiry "
+            f"coming for it. This process may now do exactly one thing with "
+            f"it — RELEASE. It will not resume the command, re-arm, or treat "
+            f"the session as its own.",
+            level="CRITICAL")
 
     # --- supervised capability probe --------------------------------------
 

@@ -1060,14 +1060,16 @@ def test_an_error_after_the_hold_still_hands_the_inverter_back():
 # Duration and renewal-timing validation
 # ---------------------------------------------------------------------------
 
-def test_a_zero_duration_hold_is_refused_because_it_has_no_watchdog():
-    """30408=0 is not "no timeout"; it is a session nothing will ever end."""
+def test_a_zero_duration_hold_is_refused():
+    """30408=0 would assert a timeout semantic this hardware never showed at
+    any value -- the watchdog test found 30407 still 1 well past the window.
+    Nothing here is a substitute for the release that actually ends a session."""
     _backend, app, session = make(clean())
 
     result = session.hold(duration_minutes=0)
 
     assert result.refused is True
-    assert "NO WATCHDOG" in result.detail
+    assert "has not demonstrated" in result.detail
     assert app.writes == []
 
 
@@ -1375,14 +1377,14 @@ def test_the_observation_must_outlast_the_window_it_watches():
     assert app.writes == []
 
 
-def test_the_watchdog_test_refuses_a_session_with_no_watchdog():
+def test_the_watchdog_test_refuses_a_zero_duration_too():
     backend, app, session = make(clean())
 
     result = session.watchdog_test(wait=make_waiter(backend, app),
                                    duration_minutes=0, observe_seconds=90)
 
     assert result.refused is True
-    assert "NO WATCHDOG" in result.detail
+    assert "has not demonstrated" in result.detail
     assert app.writes == []
 
 

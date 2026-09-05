@@ -17,6 +17,7 @@ from .commissioning import (
     DEFAULT_WATCHDOG_MINUTES,
     DEFAULT_WATCHDOG_OBSERVE_SECONDS,
 )
+from .lease import LeaseRecord, SessionLease
 from .upstream_vpp import (
     COMMISSIONING_ACTIONS,
     CommandPlan,
@@ -53,6 +54,8 @@ __all__ = [
     "DEFAULT_WATCHDOG_MINUTES",
     "DEFAULT_WATCHDOG_OBSERVE_SECONDS",
     "DryRunExecutor",
+    "LeaseRecord",
+    "SessionLease",
     "HaCommissioningExecutor",
     "HaReadOnlyExecutor",
     "build_executor",

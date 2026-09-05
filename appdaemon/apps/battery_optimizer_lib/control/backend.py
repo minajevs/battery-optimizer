@@ -81,7 +81,8 @@ class InverterCommand:
 
         ``power_percent`` and ``duration_minutes`` are deliberately excluded,
         preserving the original behaviour: a duplicate is about *what the
-        inverter is being asked to do*, not about the watchdog window.
+        inverter is being asked to do*, not about the duration field — which
+        this hardware does not enforce anyway.
         """
         return (
             self.action,

@@ -21,7 +21,7 @@ hardware, and adopting 30100 on the strength of it is exactly the inference
 this module exists to refuse. So the lifecycle runs in one process instead.
 
     1. ``hold()``     — open a timed VPP session at +1 %
-    2. ``renew()``    — prove the watchdog can be re-armed
+    2. ``renew()``    — rewrite the duration field mid-session
     3. ``release()``  — give the inverter back to its own logic
 
 That is the minimal VPP path — 30408, 30409, 30100, 30407 and nothing else —
@@ -63,9 +63,12 @@ against real hardware:
   ``safe_to_stop`` is False, because nothing but this process can make it
   True. Only an explicit operator force-abort (a second interrupt) stops it.
 
-The watchdog window is validated before anything is written: 30408=0 is not
-"no timeout" but a session nothing would ever end, and the accepted range is
-``MIN_COMMISSIONING_MINUTES``..``MAX_COMMISSIONING_MINUTES``.
+The duration is validated before anything is written, though no value of it
+bounds anything on this hardware: the accepted range is
+``MIN_COMMISSIONING_MINUTES``..``MAX_COMMISSIONING_MINUTES``, and 0 is refused
+rather than treated as "no timeout". What actually ends a session is a release
+from the process that opened it, or a supervised recovery on the strength of
+the durable lease (``control/lease.py``).
 
 ``probe_priority_mode()`` is deliberately NOT part of it. It is a supervised
 capability probe, and its result licenses nothing by itself: knowing that
@@ -130,7 +133,7 @@ MIN_COMMISSIONING_MINUTES = 1
 MAX_COMMISSIONING_MINUTES = 10
 
 # The renewal experiment must re-arm AFTER the per-register write cooldown has
-# expired, or it measures the cooldown instead of the watchdog.
+# expired, or it measures the cooldown instead of the duration field.
 DEFAULT_RENEW_AFTER_SECONDS = 35
 
 # The watchdog test asks the OPPOSITE question from the renewal experiment:
@@ -278,6 +281,15 @@ class CommissioningSession:
                 f"driving one inverter is not a supervised state. Turn it off "
                 f"(30411 and all 60 period registers go to 0) and re-run")
 
+        if session is SessionState.RECOVERABLE_LEASE:
+            return None, self._refuse(
+                operation,
+                "STRANDED SESSION: a durable lease says a previous instance "
+                "left a session armed on this inverter, and nothing in the "
+                "hardware will end it. Clean that up first — "
+                "`--operation recover` — and note that recovery RELEASES; it "
+                "never resumes the command it finds")
+
         if session is SessionState.AUTHORITY_HELD_NOT_OURS:
             return None, self._refuse(
                 operation,
@@ -310,7 +322,7 @@ class CommissioningSession:
     def _validate_duration(
         self, operation: str, duration_minutes
     ) -> Optional[CommissioningResult]:
-        """Refuse an unusable watchdog window before touching the inverter.
+        """Refuse an unusable duration before touching the inverter.
 
         Returns a refusal, or None when the value is fit to write. Checked
         here rather than at the CLI because the library is what actually
@@ -328,10 +340,11 @@ class CommissioningSession:
             return self._refuse(
                 operation,
                 f"duration {duration_minutes} min would write 30408="
-                f"{duration_minutes}. That is not 'no timeout', it is a "
-                f"session with NO WATCHDOG: nothing would return the inverter "
-                f"to its base mode if this process died holding it. Minimum "
-                f"is {MIN_COMMISSIONING_MINUTES} min")
+                f"{duration_minutes}, asserting a timeout semantic this "
+                f"hardware has not demonstrated at any value. Nothing returns "
+                f"the inverter to its base mode if this process dies holding "
+                f"it — the durable lease and a supervised recovery do. "
+                f"Minimum is {MIN_COMMISSIONING_MINUTES} min")
 
         if duration_minutes > MAX_COMMISSIONING_MINUTES:
             return self._refuse(
@@ -361,7 +374,7 @@ class CommissioningSession:
                 f"renewal delay {renew_after_seconds}s is inside the {cooldown}s "
                 f"per-register write cooldown, so the re-arm would be refused "
                 f"by the cooldown and the experiment would measure that "
-                f"instead of the watchdog")
+                f"instead of the duration field")
 
         window = duration_minutes * 60
         if renew_after_seconds >= window:
@@ -416,11 +429,14 @@ class CommissioningSession:
     def renew(
         self, duration_minutes: int = DEFAULT_COMMISSIONING_MINUTES
     ) -> CommissioningResult:
-        """Re-arm the watchdog on the session THIS process opened.
+        """Rewrite the duration field on the session THIS process opened.
 
         Nothing upstream documents that rewriting 30408 alone renews a timed
         session, which is why the normal path re-arms every slot. This is the
-        operation that finds out whether that is true.
+        operation that was to find out whether that is true — and it cannot,
+        on this hardware: 30408 neither counts down nor bounds anything, so
+        there is no expiry for a renewal to postpone. Kept because the write
+        itself is part of the arming sequence and must keep working.
         """
         operation = "timer_renewal"
         invalid = self._validate_duration(operation, duration_minutes)
@@ -550,6 +566,70 @@ class CommissioningSession:
         return self._record(CommissioningResult(
             operation=operation, ok=False, state=state,
             detail=f"release returned {result.value}"))
+
+    # --- recovery of a session a previous instance left behind -------------
+
+    def recover(
+        self,
+        wait,
+        release_timeout_seconds: int = DEFAULT_RELEASE_TIMEOUT_SECONDS,
+        poll_seconds: int = 5,
+    ) -> CommissioningResult:
+        """Release a session this process's PREVIOUS instance left armed.
+
+        The one operation that acts on authority this process did not take,
+        and it is allowed exactly because of what it does: it makes the
+        inverter less controlled than it found it. It cannot resume a command,
+        cannot re-arm, and reaches no state from which anything else could —
+        the only path out is the same release lifecycle every other operation
+        ends with.
+
+        Whether the session is ours to clean up is decided by
+        ``reconcile()`` against the durable lease, never here and never from
+        the registers alone. Without a lease, 30100=1 stays
+        AUTHORITY_HELD_NOT_OURS and this refuses.
+        """
+        operation = "recover"
+        self.observations = []
+
+        if not self.backend.commissioning:
+            return self._refuse(operation, "backend is not in commissioning mode")
+
+        state = self.backend.reconcile()
+        if state is None:
+            return self._refuse(
+                operation, "inverter state is unreadable; refusing to act blind")
+
+        session = self.backend.session_state
+
+        if session is SessionState.AUTHORITY_HELD_NOT_OURS:
+            return self._refuse(
+                operation,
+                "30100=1 but there is no lease for it, so this is not a "
+                "stranded session of ours to clean up. Recovery acts only on "
+                "durable evidence that a previous instance of THIS process "
+                "started it — establish what set the authority instead")
+
+        if session is not SessionState.RECOVERABLE_LEASE:
+            if state.control_authority == 0 and state.remote_enabled == 0:
+                return self._refuse(
+                    operation,
+                    f"nothing to recover: the inverter is at 0/0 "
+                    f"(session_state={session.value}). Any stale lease has "
+                    f"been discarded")
+            return self._refuse(
+                operation,
+                f"nothing to recover: no lease matched this inverter "
+                f"(session_state={session.value}, 30100="
+                f"{state.control_authority}, 30407={state.remote_enabled})")
+
+        self._observe("stranded session found", with_power=True)
+
+        return self._release_and_report(
+            operation, wait, release_timeout_seconds, poll_seconds,
+            "recovering a session left armed by a previous instance; it is "
+            "being released, NOT resumed",
+            steps_ok=True)
 
     # --- the long-lived supervised session test ---------------------------
 

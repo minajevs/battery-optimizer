@@ -18,6 +18,10 @@ anywhere near it.
                   inverter end the session by itself? Polls 30100/30407/30408/
                   30409 and the measured battery and grid power every few
                   seconds, past the expiry, then releases.
+    recover       release a session a PREVIOUS run left armed, using the
+                  durable lease as evidence that it is ours to clean up
+    strand        deliberately abandon an armed +1% session, for testing
+                  recovery. Requires --strand-i-will-recover as well
     release       give the inverter back to its own local logic
     probe         write 30476 to a different value, read it back, restore it
 
@@ -54,12 +58,23 @@ cleanup force-aborts and may leave the inverter armed — it says so, loudly,
 and `--operation state` is how you check. A reporting timeout marks the test
 failed but never ends the cleanup on its own.
 
-**If the process is killed outright, nothing rescues the inverter.** The
-timed override was expected to expire by itself; `watchdog-test` established
-on 2026-09-05 that it does not (30407 still 1 at t=90s after a 60 s window).
-The bounded 1-10 minute duration is therefore a bound on the operator's
-attention, not a safety net. `--operation release` and `--operation state` are
-what end and check a stranded session.
+**If the process is killed outright, nothing in the hardware rescues the
+inverter.** The timed override was expected to expire by itself; `watchdog-test`
+established on 2026-09-05 that it does not (30407 still 1 at t=90s after a 60 s
+window). The bounded 1-10 minute duration is therefore a bound on the
+operator's attention, not a safety net.
+
+What does rescue it is the durable lease at `--lease-path`, written BEFORE
+authority is taken and removed only once both halves of a release are
+confirmed. A later run that finds a lease AND a matching armed inverter is
+allowed exactly one thing: `--operation recover`, which releases. It never
+resumes the command, never re-arms, and never adopts the session as its own.
+Without a lease, 30100=1 stays AUTHORITY_HELD_NOT_OURS and nothing touches it.
+
+`--operation strand` exists to test that path honestly: it opens a +1% HOLD,
+confirms it, and then terminates the process outright, leaving the inverter
+armed exactly as a crash would. Run `--operation recover` afterwards. Nothing
+else in this file will ever leave a session behind on purpose.
 
 `release` remains for the aftermath of exactly that: it refuses to revoke
 authority this process did not take, so it is a safe thing to try and a
@@ -92,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -102,6 +118,7 @@ sys.path.insert(0, "appdaemon/apps")
 from battery_optimizer_lib.config import BatteryOptimizerConfig          # noqa: E402
 from battery_optimizer_lib.control import (                             # noqa: E402
     CommissioningSession,
+    SessionLease,
     SessionState,
     UpstreamVppBackend,
     build_executor,
@@ -116,7 +133,10 @@ from battery_optimizer_lib.control.commissioning import (               # noqa: 
 
 # No "hold" and no "renew": see the module docstring. An operation that can
 # only open a session this process cannot close is not offered at all.
-WRITING_OPERATIONS = ("session-test", "watchdog-test", "probe", "release")
+WRITING_OPERATIONS = ("session-test", "watchdog-test", "recover", "strand",
+                      "probe", "release")
+
+DEFAULT_LEASE_PATH = os.path.expanduser("~/.battery_optimizer_commission_lease.json")
 
 
 class RestApp:
@@ -225,6 +245,18 @@ class RestApp:
         return bool(due)
 
 
+def print_lease(backend) -> None:
+    record = backend.lease.read()
+    if record is None:
+        print(f"  lease                     = none ({backend.lease.path})")
+        return
+    print(f"  lease                     = {record.describe()}")
+    print( "                              ^ a session may still be armed from "
+           "an earlier run;")
+    print( "                                --operation recover releases it "
+           "(never resumes it)")
+
+
 def print_state(backend) -> None:
     state = backend.read_state()
     if state is None:
@@ -280,6 +312,50 @@ def wait_for_release(app, backend, timeout_seconds: int) -> bool:
     return confirmed
 
 
+def strand(app, session, backend, duration_minutes, acknowledged: bool) -> int:
+    """Open a session and abandon it, the way a killed process would.
+
+    The only operation here that deliberately leaves an inverter armed, and it
+    exists for one reason: the recovery path must be proved against the real
+    failure rather than against a simulation of it. So the exit is os._exit --
+    no cleanup, no finally blocks, no scheduled disarm surviving in a timer --
+    which is exactly what SIGKILL would leave behind, and exactly the state
+    `--operation recover` has to be able to find.
+
+    Harmless by construction: the session it strands is the +1% HOLD, measured
+    on the reference WIT at roughly 100-150 W of charge with the house load on
+    the grid. Nothing about it is energetic; what is dangerous is leaving it
+    there, which is the point.
+    """
+    if not acknowledged:
+        print("REFUSED: 'strand' LEAVES THE INVERTER ARMED and no hardware "
+              "expiry will end it. Re-run with --strand-i-will-recover if you "
+              "are about to run --operation recover.")
+        return 2
+
+    result = session.hold(duration_minutes=duration_minutes)
+    print()
+    print(result.describe())
+
+    if not result.ok:
+        print("\nthe hold did not arm, so there is nothing stranded. "
+              "Releasing normally.")
+        session.release()
+        print_state(backend)
+        print_lease(backend)
+        return 1
+
+    print_state(backend)
+    print_lease(backend)
+    print("\nABANDONING THIS PROCESS NOW — the inverter stays armed, exactly "
+          "as it would after a crash.")
+    print("Recover it with:  --operation recover --confirm")
+    sys.stdout.flush()
+    # Not sys.exit: that unwinds, and an orderly unwind is the one thing this
+    # operation must not do.
+    os._exit(0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ha-url", required=True)
@@ -315,6 +391,14 @@ def main() -> int:
                              "before re-arming (must clear the 30 s cooldown)")
     parser.add_argument("--release-timeout", type=int, default=240,
                         help="session-test: how long to wait for RELEASED")
+    parser.add_argument("--lease-path", default=DEFAULT_LEASE_PATH,
+                        help="durable record of an unfinished session. It is "
+                             "the only thing that lets a later run recognise "
+                             "a stranded session as ours to release")
+    parser.add_argument("--strand-i-will-recover", action="store_true",
+                        help="strand: acknowledge that this LEAVES THE "
+                             "INVERTER ARMED and that you will run "
+                             "--operation recover next")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--battery-power-direction",
                         default="negative_is_charging")
@@ -335,6 +419,7 @@ def main() -> int:
     config = BatteryOptimizerConfig(
         device_id=args.device_id,
         control_mode="commissioning",
+        session_lease_path=args.lease_path,
         soc_sensor="sensor.growatt_battery_battery_soc",
         battery_power_sensor="sensor.growatt_battery_battery_power",
         battery_power_direction=args.battery_power_direction,
@@ -353,6 +438,7 @@ def main() -> int:
         backend.reconcile()
         print(f"\nsession_state = {backend.session_state.value}\n")
         print_state(backend)
+        print_lease(backend)
         return 0
 
     print(f"--- {args.operation} ---")
@@ -371,6 +457,12 @@ def main() -> int:
             poll_seconds=args.poll_seconds,
             release_timeout_seconds=args.release_timeout,
         )
+    elif args.operation == "recover":
+        result = session.recover(wait=make_wait(app),
+                                 release_timeout_seconds=args.release_timeout)
+    elif args.operation == "strand":
+        return strand(app, session, backend, duration_minutes,
+                      acknowledged=args.strand_i_will_recover)
     elif args.operation == "probe":
         result = session.probe_priority_mode()
     else:

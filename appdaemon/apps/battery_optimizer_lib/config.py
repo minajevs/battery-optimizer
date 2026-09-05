@@ -130,6 +130,12 @@ class BatteryOptimizerConfig:
     # Seconds between revoking control authority and disarming remote control
     # on release. SCHEDULED, never slept on.
     release_settle_seconds: int = 35
+    # Where the durable session lease is written. It is the ONLY thing that can
+    # tell a restarted process that a session left armed on the inverter is its
+    # own to clean up -- the hardware has no expiry that would end one (see
+    # control/lease.py). Empty disables persistence, which means a crash mid-
+    # session strands the inverter until someone notices by hand.
+    session_lease_path: str = ""
     # "auto" = use register 30476 only if a supervised probe confirmed it is
     # genuinely writable; "never" = never write it.
     priority_mode_write: str = "auto"
@@ -492,6 +498,7 @@ class BatteryOptimizerConfig:
             effect_failure_limit=int(args.get("effect_failure_limit", 2)),
             wit_cooldown_seconds=int(args.get("wit_cooldown_seconds", 30)),
             release_settle_seconds=int(args.get("release_settle_seconds", 35)),
+            session_lease_path=args.get("session_lease_path", ""),
             priority_mode_write=args.get("priority_mode_write", "auto"),
             control_mode=args.get("control_mode", "dry_run"),
             use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),
