@@ -1757,7 +1757,7 @@ class UpstreamVppBackend:
         if raw is None:
             return None
         direction = getattr(self.config, "battery_power_direction",
-                            "negative_is_charging")
+                            "positive_is_charging")
         return -raw if direction == "negative_is_charging" else raw
 
     def _read_power(self, entity: str) -> Optional[float]:

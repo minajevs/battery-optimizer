@@ -78,7 +78,7 @@ class SessionReaper(hass.Hass):
             battery_power_sensor=self.args.get(
                 "battery_power_sensor", "sensor.growatt_battery_battery_power"),
             battery_power_direction=self.args.get("battery_power_direction",
-                                                  "negative_is_charging"),
+                                                  "positive_is_charging"),
             grid_import_power_sensor=self.args.get(
                 "grid_import_power_sensor",
                 "sensor.growatt_grid_grid_import_power"),

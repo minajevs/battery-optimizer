@@ -1285,10 +1285,20 @@ def test_safe_to_stop_is_false_in_both_dangerous_states():
 # ---------------------------------------------------------------------------
 
 def test_diagnostics_publish_raw_beside_normalized_telemetry():
-    """Raw next to normalized is what makes a wrong polarity visible in HA."""
+    """Raw next to normalized is what makes a wrong polarity visible in HA.
+
+    The direction is DECLARED here rather than left to the default. This test
+    used to assert the default's value, which made it a test of what the
+    default happened to be -- and the default changed on 2026-09-06, when the
+    reference installation stopped inverting a sensor that was already
+    canonical. What matters is that both numbers are published and that the
+    normalization follows the declaration, whichever way it points.
+    """
     app = FakeServiceApp(response={"success": True, "values": [0] * 8})
-    config = BatteryOptimizerConfig(device_id="dev", control_mode="read_only")
-    app.states[config.battery_power_sensor] = "-1500"      # raw: CHARGING
+    config = BatteryOptimizerConfig(
+        device_id="dev", control_mode="read_only",
+        battery_power_direction="negative_is_charging")
+    app.states[config.battery_power_sensor] = "-1500"      # raw: CHARGING here
     app.states[config.grid_import_power_sensor] = "1600"
     app.states[config.grid_export_power_sensor] = "0"
     app.states[config.grid_power_sensor] = "1200"          # diagnostic only
@@ -1306,6 +1316,22 @@ def test_diagnostics_publish_raw_beside_normalized_telemetry():
     assert diag["battery_power_sensor"] == config.battery_power_sensor
     assert diag["control_status"] == "DRY_RUN"
     assert diag["executor"] == "ha_read_only"
+
+
+def test_a_canonical_sensor_is_passed_through_unchanged():
+    """The reference installation's setting since 2026-09-06: the integration
+    publishes positive = charging, so there is nothing left to invert."""
+    app = FakeServiceApp(response={"success": True, "values": [0] * 8})
+    config = BatteryOptimizerConfig(device_id="dev", control_mode="read_only")
+    app.states[config.battery_power_sensor] = "-1500"      # raw: DISCHARGING here
+    backend = UpstreamVppBackend(app, config, executor=build_executor(app, config))
+
+    backend.read_state()
+    diag = backend.get_diagnostics()
+
+    assert diag["battery_power_direction"] == "positive_is_charging"
+    assert diag["battery_power_raw_w"] == -1500
+    assert diag["battery_power_normalized_w"] == -1500
 
 
 def test_diagnostics_publish_tou_state_and_that_the_fallback_is_off():

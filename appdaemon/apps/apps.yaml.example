@@ -89,10 +89,14 @@ battery_optimizer:
   # Battery power polarity is DECLARED, not guessed. Confirm it on your unit
   # before enabling any write: watch battery SOC while the battery charges and
   # note the sign this sensor reports.
-  #   negative_is_charging  - the reference Growatt WIT
+  #   positive_is_charging  - the reference Growatt WIT, whose raw register is
+  #                           already canonical. Keep the integration's "Invert
+  #                           Battery Power" option OFF: with it on, this setting
+  #                           has to invert the inversion, and the pair is one
+  #                           toggle away from reading every trade backwards.
   #   positive_is_charging  - other models / integration options
   battery_power_sensor: "sensor.growatt_battery_battery_power"
-  battery_power_direction: negative_is_charging
+  battery_power_direction: positive_is_charging
   #
   # Grid direction comes from the two ALWAYS-POSITIVE sensors, never the signed
   # one: the integration's `invert_grid_power` option flips signed Grid Power

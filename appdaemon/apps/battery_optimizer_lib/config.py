@@ -11,7 +11,14 @@ from typing import Optional
 # Declared battery-power polarities. There is no "auto": inferring polarity
 # from a live reading needs a known charge/discharge event to calibrate
 # against, and getting it wrong silently inverts every trading verdict. The
-# reference WIT is negative_is_charging, confirmed against SOC movement.
+# reference WIT publishes positive_is_charging, because the raw register is already
+# canonical (31200/31201 read -456.7 W while SOC was falling) and the integration's
+# "Invert Battery Power" option is now OFF, as it should always have been.
+#
+# It was negative_is_charging until 2026-09-06, and that was right only by accident:
+# the integration inverted a sign that needed no inverting, and this setting inverted
+# it back. Two wrongs producing a right-looking number, one toggle away from silently
+# inverting every trading verdict. Both halves were corrected together.
 BATTERY_POWER_DIRECTIONS = ("negative_is_charging", "positive_is_charging")
 
 # How the control backend may talk to the inverter. Ordered by capability.
@@ -80,7 +87,7 @@ class BatteryOptimizerConfig:
     # so it is configuration. The backend normalizes it exactly once and
     # everything above the backend sees positive = charging.
     battery_power_sensor: str = "sensor.growatt_battery_battery_power"
-    battery_power_direction: str = "negative_is_charging"
+    battery_power_direction: str = "positive_is_charging"
     # Grid flow for EFFECT uses the two ALWAYS-POSITIVE directional sensors,
     # never the signed one. Upstream applies its `invert_grid_power` option to
     # signed Grid Power but explicitly NOT to these two, so no integration
@@ -496,7 +503,7 @@ class BatteryOptimizerConfig:
             battery_charge_sensor=args.get("battery_charge_sensor", "sensor.growatt_battery_charge_today"),
             battery_discharge_sensor=args.get("battery_discharge_sensor", "sensor.growatt_battery_discharge_today"),
             battery_power_sensor=args.get("battery_power_sensor", "sensor.growatt_battery_battery_power"),
-            battery_power_direction=args.get("battery_power_direction", "negative_is_charging"),
+            battery_power_direction=args.get("battery_power_direction", "positive_is_charging"),
             grid_import_power_sensor=args.get("grid_import_power_sensor", "sensor.growatt_grid_grid_import_power"),
             grid_export_power_sensor=args.get("grid_export_power_sensor", "sensor.growatt_grid_grid_export_power"),
             grid_power_sensor=args.get("grid_power_sensor", "sensor.growatt_grid_grid_power"),

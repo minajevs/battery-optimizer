@@ -27,6 +27,7 @@ import argparse
 import datetime
 import json
 import sys
+import time
 import urllib.request
 
 sys.path.insert(0, "appdaemon/apps")
@@ -61,16 +62,28 @@ def entity(ha_url, token, eid):
         return f"ERR {e}", -1
 
 
-def read_registers(ha_url, token, device_id, start, count):
-    try:
-        d = api(ha_url, token,
-                "/api/services/growatt_modbus/get_register_data?return_response",
-                {"device_id": device_id, "register_type": "input",
-                 "start_address": start, "count": count})
-        response = d.get("service_response", d)
-        return response.get("values") or []
-    except Exception:
-        return []
+def read_registers(ha_url, token, device_id, start, count, attempts=3):
+    """Read, retrying: a single miss is bus contention, not a missing register.
+
+    The coordinator polls the same bus, so an on-demand read can lose a race
+    with it. Reporting that as UNREADABLE once cost a snapshot that looked like
+    a dead inverter -- and this snapshot is what a polarity change is judged on.
+    """
+    for attempt in range(attempts):
+        try:
+            d = api(ha_url, token,
+                    "/api/services/growatt_modbus/get_register_data?return_response",
+                    {"device_id": device_id, "register_type": "input",
+                     "start_address": start, "count": count})
+            response = d.get("service_response", d)
+            values = response.get("values") or []
+            if values:
+                return values
+        except Exception:
+            pass
+        if attempt + 1 < attempts:
+            time.sleep(2)
+    return []
 
 
 def signed32(values, index):

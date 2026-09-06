@@ -474,7 +474,7 @@ def main() -> int:
                              "--operation recover next")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--battery-power-direction",
-                        default="negative_is_charging")
+                        default="positive_is_charging")
     args = parser.parse_args()
 
     duration_minutes = args.duration_minutes
