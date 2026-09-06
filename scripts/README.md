@@ -1,3 +1,53 @@
+# Deploying to this installation
+
+`deploy.ps1` below came from the upstream repository this project was forked
+from. It is Windows PowerShell and it targets `\\192.168.33.167`, a host that
+does not exist on this network — Home Assistant runs at **192.168.1.130**.
+Keep it for reference; use `deploy.py` for this installation.
+
+## deploy.py (macOS, over a mounted Samba share)
+
+The instance exposes no SSH and no file API: only Home Assistant on 8123 and
+the Supervisor observer on 4357, and the available token is not an admin one
+(`/api/hassio/*` answers 401). So files go over the **Samba share** add-on, and
+**nothing is restarted automatically** — a script that cannot verify a restart
+happened has no business claiming it did.
+
+One-time, after installing and starting the Samba share add-on:
+
+```bash
+mkdir -p /Volumes/ha-config /Volumes/ha-addons
+mount_smbfs //<user>@192.168.1.130/config        /Volumes/ha-config
+mount_smbfs //<user>@192.168.1.130/addon_configs /Volumes/ha-addons
+```
+
+Then:
+
+```bash
+# the Growatt integration -> /config/custom_components/growatt_modbus
+uv run python scripts/deploy.py --target integration            # dry run
+uv run python scripts/deploy.py --target integration --confirm --prune
+# then: Settings > System > Restart Home Assistant
+#   (a config-entry reload re-uses the already-imported modules)
+
+# the optimizer and the session reaper -> the AppDaemon apps directory
+# STOP the AppDaemon add-on first: it hot-reloads on every .py change, so a
+# multi-file copy imports new modules against old ones.
+uv run python scripts/deploy.py --target appdaemon --confirm --prune \
+    --appdaemon-stopped
+# then: Settings > Add-ons > AppDaemon > Start
+```
+
+Every run: preflight (tests in the repo that owns the target, byte-compile with
+an interpreter at least as new as HA's 3.13), timestamped backup into
+`deploy-backups/` beside the tree (never inside it — a backup under
+`custom_components/` would itself be scanned as an integration), copy only what
+differs, `--prune` what the source no longer has, delete `__pycache__`, then
+verify every file by SHA256. `apps.yaml` is never deployed: the live one holds
+the HA token and this installation's tuning.
+
+---
+
 # scripts/
 
 Deployment tooling for the AppDaemon share. Both scripts are read-only until
