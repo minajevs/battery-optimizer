@@ -163,3 +163,44 @@ def test_a_release_that_reports_ok_but_did_not_reach_RELEASED_is_a_failure():
 
     assert result.lifecycle is OptimizerLifecycle.RECOVERY_FAILED
     assert result.ready is False
+
+
+# ---------------------------------------------------------------------------
+# Unreadable is not idle. Found on the first live deployment, 2026-09-10.
+# ---------------------------------------------------------------------------
+
+class UnreadableBackend(Backend):
+    """reconcile() fails, and session_state keeps its initial NOT_ARMED."""
+
+    def reconcile(self):
+        self.reconciled += 1
+        return None
+
+
+def test_an_unreadable_inverter_is_not_reported_as_nothing_to_recover():
+    """The live failure: the register read returned nothing, session_state was
+    still its initial NOT_ARMED, and startup announced "nothing to recover".
+    That is a false all-clear over a possibly stranded session."""
+    backend = UnreadableBackend(SessionState.NOT_ARMED)
+    session = Session(backend)
+    result = recover_previous_session(backend, session, Heartbeat(500.0),
+                                      wait=lambda s: None,
+                                      stale_after_seconds=90.0)
+
+    assert result.lifecycle is OptimizerLifecycle.INVERTER_UNREADABLE
+    assert result.ready is False
+    assert result.should_retry is True
+    assert session.calls == [], "it must not act on an inverter it cannot read"
+    assert "Unreadable is not idle" in result.detail
+
+
+def test_an_unreadable_inverter_hides_even_a_recoverable_lease():
+    """session_state may say anything when the read failed; it is not evidence."""
+    backend = UnreadableBackend(SessionState.RECOVERABLE_LEASE)
+    session = Session(backend)
+    result = recover_previous_session(backend, session, Heartbeat(500.0),
+                                      wait=lambda s: None,
+                                      stale_after_seconds=90.0)
+
+    assert result.lifecycle is OptimizerLifecycle.INVERTER_UNREADABLE
+    assert session.calls == []

@@ -47,6 +47,11 @@ class OptimizerLifecycle(enum.Enum):
     #: Authority is held with no lease accounting for it. Not ours to release
     #: and not ours to build on.
     FOREIGN_AUTHORITY = "foreign_authority"
+    #: The inverter could not be read at all, so NOTHING is known about it —
+    #: including whether a previous session is still armed. Unreadable is not
+    #: idle, and treating it as idle is how a stranded session gets declared
+    #: clean. Retried.
+    INVERTER_UNREADABLE = "inverter_unreadable"
 
 
 @dataclass(frozen=True)
@@ -63,7 +68,8 @@ class StartupRecovery:
     @property
     def should_retry(self) -> bool:
         """Is this a state the app can get itself out of by trying again?"""
-        return self.lifecycle is OptimizerLifecycle.RECOVERY_FAILED
+        return self.lifecycle in (OptimizerLifecycle.RECOVERY_FAILED,
+                                  OptimizerLifecycle.INVERTER_UNREADABLE)
 
 
 def recover_previous_session(
@@ -84,7 +90,20 @@ def recover_previous_session(
         if log is not None:
             log(f"[startup] {message}", level=level)
 
-    backend.reconcile()
+    # reconcile() returns None when the inverter could not be read. Reading
+    # backend.session_state anyway would yield NOT_ARMED — its initial value —
+    # and that is indistinguishable from a genuinely idle inverter. On the
+    # first live deployment (2026-09-10) exactly that happened: the read failed
+    # and startup reported "nothing to recover (session_state=not_armed)",
+    # which would have been a false all-clear over a stranded session.
+    if backend.reconcile() is None:
+        detail = ("the inverter could not be read, so nothing is known about "
+                  "it — including whether a previous session is still armed. "
+                  "Unreadable is not idle. Scheduled control stays off and "
+                  "this will be retried")
+        say(detail, level="ERROR")
+        return StartupRecovery(OptimizerLifecycle.INVERTER_UNREADABLE, detail)
+
     state = backend.session_state
 
     if state is SessionState.AUTHORITY_HELD_NOT_OURS:

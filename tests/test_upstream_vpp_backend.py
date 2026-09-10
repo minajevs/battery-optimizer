@@ -1732,3 +1732,41 @@ def test_reconcile_is_a_no_op_without_read_capability():
     backend.executor.can_read = False
 
     assert backend.reconcile() is None
+
+
+# ---------------------------------------------------------------------------
+# Response unwrapping. Found live on 2026-09-10: the read failed with no error
+# anywhere, which reads as a dead inverter rather than a parsing bug.
+# ---------------------------------------------------------------------------
+
+def _reader():
+    from battery_optimizer_lib.control.upstream_vpp import HaReadOnlyExecutor
+    app = FakeApp()
+    return HaReadOnlyExecutor(app, device_id="dev", log_func=app.log), app
+
+
+@pytest.mark.parametrize("shape", [
+    {"success": True, "values": [1, 2, 3]},                        # bare
+    {"response": {"success": True, "values": [1, 2, 3]},
+     "context": {"id": "x"}},                                      # AppDaemon 4.5
+    {"result": {"success": True, "values": [1, 2, 3]}},            # older AD
+])
+def test_every_wrapper_the_callers_actually_produce_is_unwrapped(shape):
+    reader, _app = _reader()
+    assert reader._extract_values(shape, 3) == [1, 2, 3]
+
+
+def test_a_failed_read_says_what_it_got_instead_of_looking_like_a_dead_inverter():
+    reader, app = _reader()
+
+    assert reader._extract_values({"context": {"id": "x"}}, 2) is None
+    assert any("has no 'values'" in m for m, _lvl in app.logs)
+
+    app.logs.clear()
+    assert reader._extract_values(None, 2) is None
+    assert any("not a dict" in m for m, _lvl in app.logs)
+
+
+def test_an_explicit_failure_from_the_handler_is_still_a_failure():
+    reader, _app = _reader()
+    assert reader._extract_values({"success": False, "values": [1]}, 1) is None

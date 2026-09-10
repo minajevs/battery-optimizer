@@ -415,7 +415,10 @@ class BatteryOptimizer(hass.Hass):
             )
 
         if self._heartbeat.enabled:
-            self._heartbeat.stamp()
+            # Stamped ONLY once the lifecycle is READY -- see _stamp_heartbeat.
+            # The timer starts regardless so that a later recovery, once it
+            # clears, resumes stamping without needing a restart.
+            self._stamp_heartbeat()
             self.run_every(
                 self._stamp_heartbeat,
                 self.datetime() + datetime.timedelta(seconds=5),
@@ -1367,7 +1370,22 @@ class BatteryOptimizer(hass.Hass):
                      level="WARNING")
 
     def _stamp_heartbeat(self, kwargs=None):
-        """Say "still alive" for the reaper. Never raises into AppDaemon."""
+        """Say this app is alive AND owns its session correctly.
+
+        The heartbeat is not "the process exists" — it is the claim the reaper
+        reads as OWNER_ALIVE and refuses to act on. An app sitting in
+        RECOVERY_FAILED is precisely an owner that is NOT finishing its
+        session: the inverter may still be armed and this process has not
+        managed to release it. Stamping there would tell the one thing that
+        could clean it up to stand down, so it does not stamp until READY.
+
+        The consequence is deliberate: while recovery is unresolved the
+        heartbeat goes stale, which lets the reaper act and lets an external
+        watcher restart the add-on. Both are backstops this app cannot be for
+        itself.
+        """
+        if self._lifecycle is not OptimizerLifecycle.READY:
+            return
         self._heartbeat.stamp()
 
     @_timed_callback

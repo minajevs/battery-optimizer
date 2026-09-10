@@ -40,7 +40,7 @@ def test_the_heartbeat_is_constructed_before_startup_recovery_reads_it():
 def test_startup_recovery_runs_before_the_heartbeat_is_stamped():
     """The one that matters. Stamping first erases the evidence."""
     assert position("recover_previous_session(") < \
-        position("self._heartbeat.stamp()")
+        position("self._stamp_heartbeat()")
 
 
 def initialize_body() -> str:
@@ -54,9 +54,9 @@ def initialize_body() -> str:
     return SOURCE[start:end]
 
 
-def test_the_heartbeat_is_stamped_exactly_once_during_initialize():
+def test_initialize_triggers_exactly_one_stamp():
     """A second stamp inside initialize() could precede recovery again."""
-    assert initialize_body().count("self._heartbeat.stamp()") == 1
+    assert initialize_body().count("self._stamp_heartbeat()") == 1
 
 
 def test_scheduled_execution_is_gated_on_startup_recovery():
@@ -71,3 +71,30 @@ def test_only_a_failed_recovery_retries():
     """RECOVERY_BLOCKED and FOREIGN_AUTHORITY need a person, not a timer."""
     assert "self._startup.should_retry" in SOURCE
     assert "OptimizerLifecycle.RECOVERY_FAILED" in SOURCE
+
+
+def test_the_heartbeat_is_only_stamped_once_the_lifecycle_is_ready():
+    """The invariant the native watcher will ultimately trust.
+
+    The heartbeat is not "the process exists" — it is the claim the reaper
+    reads as OWNER_ALIVE and stands down on. An app in RECOVERY_FAILED is an
+    owner that has NOT finished its session, so stamping there would tell the
+    one thing that could clean up to do nothing.
+    """
+    start = SOURCE.index("    def _stamp_heartbeat(")
+    end = SOURCE.index("\n    def ", start + 1)
+    body = SOURCE[start:end]
+
+    assert "OptimizerLifecycle.READY" in body, (
+        "_stamp_heartbeat must gate on the lifecycle")
+    guard = body.index("OptimizerLifecycle.READY")
+    stamp = body.index("self._heartbeat.stamp()")
+    assert guard < stamp, "the guard must precede the stamp"
+
+
+def test_initialize_stamps_through_the_guarded_helper_not_directly():
+    """A direct stamp in initialize() would bypass the READY gate."""
+    body = initialize_body()
+    assert "self._heartbeat.stamp()" not in body, (
+        "initialize() must stamp via _stamp_heartbeat(), which enforces READY")
+    assert "self._stamp_heartbeat()" in body

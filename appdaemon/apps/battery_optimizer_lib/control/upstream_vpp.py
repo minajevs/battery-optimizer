@@ -435,18 +435,40 @@ class _HaRegisterReader:
                   level="ERROR")
         return StepResult.FAILED
 
-    @staticmethod
-    def _extract_values(result: Any, count: int) -> Optional[List[int]]:
+    def _extract_values(self, result: Any, count: int) -> Optional[List[int]]:
         """Pull the values list out of the service response.
 
-        The handler returns {"success": bool, "values": [...]}; some AppDaemon
-        versions nest that under "result".
+        The handler returns {"success": bool, "values": [...]}, but what wraps
+        it depends on who called. AppDaemon 4.5.13 asks HA for a response by
+        itself (the websocket request carries return_response: True) and hands
+        back what HA replies, which nests the handler's payload under
+        "response" alongside "context". The REST shim in commission.py unwraps
+        differently again, and older AppDaemon used "result".
+
+        Do NOT "fix" this by passing return_result=True to call_service: on
+        4.5.13 that lands in service_data, where HA rejects it against the
+        service schema, turning a misparsed response into a failed call.
+
+        An unrecognised shape is logged with its keys, because the failure it
+        produces otherwise is "inverter state unreadable" with no error
+        anywhere — which reads as a dead inverter rather than a parsing bug,
+        and cost a deployment cycle to tell apart.
         """
         if not isinstance(result, dict):
+            self._log(f"[{self.name}] get_register_data returned "
+                      f"{type(result).__name__}, not a dict — no values to "
+                      f"read", level="WARNING")
             return None
         payload = result
-        if "values" not in payload and isinstance(payload.get("result"), dict):
-            payload = payload["result"]
+        for wrapper in ("response", "result"):
+            if "values" not in payload and isinstance(payload.get(wrapper), dict):
+                payload = payload[wrapper]
+                break
+        if "values" not in payload:
+            self._log(f"[{self.name}] get_register_data response has no "
+                      f"'values' — keys were {sorted(payload)[:8]}",
+                      level="WARNING")
+            return None
         if payload.get("success") is False:
             return None
         values = payload.get("values")

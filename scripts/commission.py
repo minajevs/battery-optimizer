@@ -234,6 +234,11 @@ class RestApp:
         return service in self._response_services
 
     def call_service(self, service, hass_timeout=None, **kwargs):
+        # AppDaemon needs return_result=True to be handed a service response;
+        # this shim discovers response-capable services from /api/services and
+        # appends ?return_response itself, so the flag is not ours to forward
+        # — passing it on would send it to HA as service DATA.
+        kwargs.pop("return_result", None)
         path = f"/api/services/{service}"
         if self._returns_response(service):
             path += "?return_response"
