@@ -357,9 +357,132 @@ def test_a_manual_recover_is_fenced_too(tmp_path):
     # A real waiter, because this one runs the whole release lifecycle: the
     # settle finishes on a timer this process scheduled, so a wait that only
     # passed time would hang there.
-    result = reaper.session.recover(wait=make_waiter(backend, app))
+    result = reaper.session.recover(wait=make_waiter(backend, app),
+                                operator_override=True)
 
     assert result.ok is True
     # Fenced on the way through, and the lease is closed once released.
     assert lease.read() is None
     assert any("FENCED for recovery" in m for m, _lvl in app.logs)
+
+
+# ---------------------------------------------------------------------------
+# unclaim: a claim token per ATTEMPT, not per session
+# ---------------------------------------------------------------------------
+
+def test_unclaim_restores_the_state_the_fence_replaced(tmp_path):
+    lease, _logs = lease_at(tmp_path)
+    l1 = lease.open(device_id="dev", action="hold", setpoint_percent=1)
+    lease.mark(l1, ACTIVE)
+
+    claimed = lease.claim_for_recovery(l1.session_id)
+    assert lease.read().state == RECOVERING
+
+    assert lease.unclaim(l1.session_id, claimed.recovery_claim_id) is True
+    restored = lease.read()
+    assert restored.state == ACTIVE          # not a guess: what was there before
+    assert restored.recovery_claim_id is None
+    assert restored.claimed_at is None
+    # And the optimizer can arm again immediately.
+    assert lease.open(device_id="dev", action="hold", setpoint_percent=1) is not None
+
+
+def test_unclaim_restores_acquiring_not_a_hardcoded_active(tmp_path):
+    """The half-applied arm is fenced from ACQUIRING and must go back to it."""
+    lease, _logs = lease_at(tmp_path)
+    l1 = lease.open(device_id="dev", action="hold", setpoint_percent=1)
+    claimed = lease.claim_for_recovery(l1.session_id)
+
+    lease.unclaim(l1.session_id, claimed.recovery_claim_id)
+    assert lease.read().state == "acquiring"
+
+
+def test_a_stale_attempt_cannot_unclaim_a_later_attempts_fence(tmp_path):
+    """The reason the claim id exists. Claim A expires, claim B fences the same
+    SESSION, then a resumed process A must not drop B's valid fence."""
+    clock = Clock()
+    lease, logs = lease_at(tmp_path, clock)
+    l1 = lease.open(device_id="dev", action="hold", setpoint_percent=1)
+
+    attempt_a = lease.claim_for_recovery(l1.session_id)
+    clock.advance(CLAIM_TTL_SECONDS + 1)          # A's claim expires
+    attempt_b = lease.claim_for_recovery(l1.session_id)
+    assert attempt_b is not None
+    assert attempt_b.recovery_claim_id != attempt_a.recovery_claim_id
+
+    # Process A wakes up and tries to tidy up after itself.
+    assert lease.unclaim(l1.session_id, attempt_a.recovery_claim_id) is False
+    assert lease.read().state == RECOVERING, "B's fence must survive"
+    assert lease.read().recovery_claim_id == attempt_b.recovery_claim_id
+    assert any(lvl == "ERROR" and "belongs to recovery attempt" in m
+               for lvl, m in logs)
+
+
+def test_unclaim_refuses_when_a_different_session_holds_the_lease(tmp_path):
+    lease, _logs = lease_at(tmp_path)
+    l1 = lease.open(device_id="dev", action="hold", setpoint_percent=1)
+    claimed = lease.claim_for_recovery(l1.session_id)
+
+    lease.close()
+    lease.open(device_id="dev", action="hold", setpoint_percent=1)
+
+    assert lease.unclaim(l1.session_id, claimed.recovery_claim_id) is False
+
+
+def test_an_aborted_recovery_hands_the_fence_back(tmp_path):
+    """The whole point: a loud abort must not latch for the claim TTL."""
+    reaper, _backend, app, lease = make_reaper(tmp_path, heartbeat_age=200.0)
+    strand_a_session(lease)
+    reaper.check()
+
+    result = reaper.session.recover(
+        wait=lambda s: None,
+        expected_session_id=reaper.assessed_session_id,
+        heartbeat=Heartbeat(1.0),          # the owner came back
+        stale_after_seconds=90.0)
+
+    assert result.refused is True
+    record = lease.read()
+    assert record.state != RECOVERING, "the fence must be handed back"
+    assert any("fence released" in m for m, _lvl in app.logs)
+
+
+def test_the_optimizer_can_arm_again_immediately_after_an_abort(tmp_path):
+    """The abort reason is usually 'the owner came back' — so the thing being
+    unblocked is precisely the process that just proved it is alive."""
+    reaper, backend, app, lease = make_reaper(tmp_path, heartbeat_age=200.0)
+    strand_a_session(lease)
+    reaper.check()
+    reaper.session.recover(
+        wait=lambda s: None,
+        expected_session_id=reaper.assessed_session_id,
+        heartbeat=Heartbeat(1.0), stale_after_seconds=90.0)
+
+    assert lease.open(device_id="dev", action="hold",
+                      setpoint_percent=1) is not None
+
+
+# ---------------------------------------------------------------------------
+# operator_override: liveness proved, or waived on purpose — never absent
+# ---------------------------------------------------------------------------
+
+def test_recover_refuses_without_liveness_or_an_explicit_override(tmp_path):
+    reaper, _backend, _app, lease = make_reaper(tmp_path, heartbeat_age=200.0)
+    strand_a_session(lease)
+
+    result = reaper.session.recover(wait=lambda s: None)
+
+    assert result.refused is True
+    assert "operator_override" in result.detail
+    assert lease.read().state != RECOVERING, "it must refuse before fencing"
+
+
+def test_the_operator_override_says_so_loudly(tmp_path):
+    reaper, backend, app, lease = make_reaper(tmp_path, heartbeat_age=200.0)
+    strand_a_session(lease)
+
+    reaper.session.recover(wait=make_waiter(backend, app),
+                           operator_override=True)
+
+    assert any("OPERATOR OVERRIDE" in m and lvl == "CRITICAL"
+               for m, lvl in app.logs)

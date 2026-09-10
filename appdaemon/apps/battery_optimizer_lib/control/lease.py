@@ -1,10 +1,13 @@
 """Durable evidence that a process started a session and may not have finished it.
 
-The hardware watchdog does not exist. A session armed with 30408=1 was observed
-still armed at t=90s (reference WIT, 2026-09-05), and only an explicit release
-ended it. So the failure this file exists for is real and unbounded: a process
-that dies holding 30100=1 / 30407=1 leaves the inverter executing its last
-command until a human intervenes.
+No expiry ends a SESSION. 30408 bounds the energetic command -- proved by
+matched runs on 2026-09-08, where the effect collapsed at 60s and 122s for
+30408 of 1 and 2 minutes -- but a session armed with 30408=1 was still armed at
+t=90s (2026-09-05), and only an explicit release ended it. So the failure this
+file exists for is real and unbounded, and it is worse than a stuck command: a
+process that dies holding 30100=1 / 30407=1 leaves the inverter with its local
+battery logic suppressed and the house drawing from the grid, indefinitely,
+after the command itself has stopped doing anything.
 
 **What a lease is NOT.** It is not proof of ownership, and it never promotes a
 session back to ACTIVE. Ownership stays what it has always been — this
@@ -82,9 +85,18 @@ class LeaseRecord:
     # could have predicted -- observed on hardware as ten rejected writes
     # before the 30 s window cleared.
     authority_written_at: Optional[float] = None
-    # When a reaper fenced this lease for recovery. Only meaningful
+    # When a reaper fenced this lease for recovery, and WHICH recovery attempt
+    # did it. The claim id is not the session id: session_id names the control
+    # session, so an unclaim carrying only that could remove a LATER attempt's
+    # valid fence — claim A expires after CLAIM_TTL_SECONDS, claim B fences the
+    # same session, then a resumed process A unclaims B's fence. Only meaningful
     # while state == RECOVERING.
     claimed_at: Optional[float] = None
+    recovery_claim_id: Optional[str] = None
+    # What to restore on unclaim. A fence is a temporary state, not a
+    # destination, so undoing it must put back what was actually there rather
+    # than assuming ACTIVE.
+    previous_state: Optional[str] = None
 
     def describe(self) -> str:
         age = max(0, int(time.time() - self.started_at))
@@ -201,6 +213,8 @@ class SessionLease:
                 pid=data.get("pid"),
                 authority_written_at=data.get("authority_written_at"),
                 claimed_at=data.get("claimed_at"),
+                recovery_claim_id=data.get("recovery_claim_id"),
+                previous_state=data.get("previous_state"),
             )
         except Exception as e:  # noqa: BLE001 - same reasoning
             self.last_error = str(e)
@@ -310,13 +324,66 @@ class SessionLease:
 
             fields = {**asdict(existing), "state": RECOVERING,
                       "claimed_at": self._clock(),
+                      "recovery_claim_id": uuid.uuid4().hex,
+                      "previous_state": existing.state,
                       "updated_at": self._clock()}
             claimed = LeaseRecord(**fields)
             if not self._write(claimed):
                 return None
-            self._log(f"FENCED for recovery: {claimed.describe()}. No new "
+            self._log(f"FENCED for recovery: {claimed.describe()} "
+                      f"(claim {claimed.recovery_claim_id[:8]}). No new "
                       f"session may be opened until this is released.")
             return claimed
+
+    def unclaim(self, session_id: str, recovery_claim_id: str) -> bool:
+        """Undo a fence THIS recovery attempt took, restoring the prior state.
+
+        The counterpart to claim_for_recovery, and CAS in the same way: it
+        restores ``previous_state`` only when the lease still carries this
+        session AND is still RECOVERING AND still carries this claim id. Any
+        mismatch means the fence being asked about is not the one this attempt
+        took, so it does nothing and says why.
+
+        Called on every abort path. Without it a refused recovery leaves the
+        lease fenced for the full CLAIM_TTL_SECONDS, and the worst case is
+        perverse: the abort reason "the owner came back" means the optimizer is
+        alive and now blocked from arming by the very fence that was protecting
+        it. A loud abort must not latch for five minutes.
+        """
+        with self._exclusive():
+            existing = self.read()
+            if existing is None:
+                self._log(f"nothing to unclaim: the lease is gone "
+                          f"(session {session_id})", level="DEBUG")
+                return False
+            if existing.session_id != session_id:
+                self._log(
+                    f"NOT unclaiming: the lease carries "
+                    f"{existing.session_id}, not {session_id}. A different "
+                    f"session holds it now", level="WARNING")
+                return False
+            if existing.state != RECOVERING:
+                self._log(f"nothing to unclaim: the lease reads "
+                          f"{existing.state}, not {RECOVERING}", level="DEBUG")
+                return False
+            if existing.recovery_claim_id != recovery_claim_id:
+                self._log(
+                    f"NOT unclaiming: the fence belongs to recovery attempt "
+                    f"{existing.recovery_claim_id}, not {recovery_claim_id}. "
+                    f"Removing it would drop somebody else's valid fence",
+                    level="ERROR")
+                return False
+
+            restored = existing.previous_state or ACTIVE
+            fields = {**asdict(existing), "state": restored,
+                      "claimed_at": None, "recovery_claim_id": None,
+                      "previous_state": None,
+                      "updated_at": self._clock()}
+            if not self._write(LeaseRecord(**fields)):
+                return False
+            self._log(f"fence released: session {session_id} is back to "
+                      f"{restored} and may be armed again")
+            return True
 
     def verify_claim(self, session_id: str) -> bool:
         """Is this still our claim, immediately before we act on it?

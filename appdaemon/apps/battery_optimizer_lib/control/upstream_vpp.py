@@ -503,7 +503,7 @@ class HaCommissioningExecutor(_HaRegisterReader):
     WRITABLE_REGISTERS = frozenset({
         REG_CONTROL_AUTHORITY,   # 30100 — take/release authority
         REG_REMOTE_ENABLE,       # 30407 — arm/disarm
-        REG_REMOTE_DURATION,     # 30408 — duration field (NOT enforced)
+        REG_REMOTE_DURATION,     # 30408 — bounds the COMMAND, not the session
         REG_REMOTE_POWER,        # 30409 — signed setpoint
         REG_PRIORITY_MODE,       # 30476 — capability probe, always restored
         # The export limit, for the supervised discharge only. These two are
@@ -888,7 +888,7 @@ class UpstreamVppBackend:
 
         # 2. Timed override. Both EEPROM-safe, rewritten every slot.
         plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
-                               note="duration (not enforced)"))
+                               note="duration — bounds the COMMAND, not the session"))
         plan.add(RegisterWrite(REG_REMOTE_POWER, self._power_target(command),
                                note="signed power target"))
 
@@ -943,7 +943,7 @@ class UpstreamVppBackend:
                          "export limit rate 0 % — serve the house, not the grid")
 
         plan.add(RegisterWrite(REG_REMOTE_DURATION, int(command.duration_minutes),
-                               note="duration (not enforced)"))
+                               note="duration — bounds the COMMAND, not the session"))
         plan.add(RegisterWrite(REG_REMOTE_POWER, self._power_target(command),
                                note="signed power target"))
 

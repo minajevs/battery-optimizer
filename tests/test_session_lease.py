@@ -152,7 +152,8 @@ def test_recovery_releases_and_never_resumes(tmp_path):
     session.hold(duration_minutes=5)
 
     backend, app, restarted = make(tmp_path, armed())
-    result = restarted.recover(wait=make_waiter(backend, app))
+    result = restarted.recover(wait=make_waiter(backend, app),
+                                operator_override=True)
 
     assert result.ok is True
     assert backend.session_state is SessionState.RELEASED
@@ -246,7 +247,8 @@ def test_an_external_schedule_blocks_recovery_rather_than_racing_it(tmp_path):
     registers[REG_TOU_NUM_PERIODS] = 16
     backend, app, restarted = make(tmp_path, registers)
 
-    result = restarted.recover(wait=make_waiter(backend, app))
+    result = restarted.recover(wait=make_waiter(backend, app),
+                                operator_override=True)
 
     assert result.refused is True
     assert backend.session_state is not SessionState.RECOVERABLE_LEASE
@@ -255,7 +257,8 @@ def test_an_external_schedule_blocks_recovery_rather_than_racing_it(tmp_path):
 def test_recovery_refuses_when_there_is_no_lease(tmp_path):
     backend, app, session = make(tmp_path, armed())
 
-    result = session.recover(wait=make_waiter(backend, app))
+    result = session.recover(wait=make_waiter(backend, app),
+                                operator_override=True)
 
     assert result.refused is True
     assert "no lease for it" in result.detail
@@ -265,7 +268,8 @@ def test_recovery_refuses_when_there_is_no_lease(tmp_path):
 def test_recovery_refuses_when_nothing_is_stranded(tmp_path):
     backend, app, session = make(tmp_path, clean())
 
-    result = session.recover(wait=make_waiter(backend, app))
+    result = session.recover(wait=make_waiter(backend, app),
+                                operator_override=True)
 
     assert result.refused is True
     assert "nothing to recover" in result.detail
@@ -344,7 +348,8 @@ def test_an_acquiring_lease_is_recoverable_too(tmp_path):
     registers[REG_REMOTE_POWER] = 1
     backend, app, session = make(tmp_path, registers)
 
-    result = session.recover(wait=make_waiter(backend, app))
+    result = session.recover(wait=make_waiter(backend, app),
+                                operator_override=True)
 
     assert result.ok is True
     assert app.registers[REG_CONTROL_AUTHORITY] == 0

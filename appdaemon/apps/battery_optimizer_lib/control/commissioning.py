@@ -115,16 +115,30 @@ from .upstream_vpp import (
 # attention span.
 #
 # It was ALSO believed that a forgotten session self-heals when the window
-# passes. It does not. See THE WATCHDOG DOES NOT FIRE below.
+# passes. It does not -- see WHAT 30408 ACTUALLY BOUNDS below. The COMMAND
+# stops; the session does not.
 DEFAULT_COMMISSIONING_MINUTES = 5
 
-# **THE WATCHDOG DOES NOT FIRE (reference WIT, 2026-09-05).** A session armed
-# with 30408=1 was left un-renewed and polled every 5 s: 30407 was still 1 at
-# t=90s, half again past the window, and only an explicit release ended it.
-# 30408 does not count down either -- it echoes the last value written. So on
-# THIS hardware, nothing has been observed to end a session except a release
-# from the process that opened it, and every claim in this project that a dying
-# process is caught by an expiry is unproven.
+# **WHAT 30408 ACTUALLY BOUNDS (reference WIT).** It enforces the ENERGETIC
+# COMMAND duration, and nothing else. Two experiments, and the distinction
+# between them is the whole point:
+#
+#   watchdog-test (2026-09-05): 30408=1, never renewed, polled every 5 s.
+#   30407 was still 1 at t=90s, and only an explicit release ended the session.
+#   30408 does not count down -- it echoes the last value written.
+#
+#   duration-test (2026-09-08), sampling 31200/31201 directly at 5 s:
+#       30408 = 1 min  ->  the battery effect collapsed at t=60s  (ratio 1.00)
+#       30408 = 2 min  ->  the battery effect collapsed at t=122s (ratio 1.02)
+#   which tracks the field to within one sample and rules out a fixed timeout.
+#
+# So: the command stops on time, and the SESSION does not end. Authority stays
+# held, 30407 stays 1, local battery logic stays suppressed, and the house moves
+# onto the grid. Nothing has been observed to end a session except a release
+# from the process that opened it or a supervised recovery, so a dying process
+# is NOT caught by an expiry -- and a slot longer than 30408 must re-arm before
+# it expires, or the command silently stops delivering while every register
+# still reads armed.
 #
 # The bounds below are kept anyway, and both ends are enforced rather than
 # advisory:
@@ -660,7 +674,9 @@ class CommissioningSession:
         session, which is why the normal path re-arms every slot. This is the
         operation that was to find out whether that is true — and it cannot,
         on this hardware: 30408 neither counts down nor bounds anything, so
-        there is no expiry for a renewal to postpone. Kept because the write
+        there is no session expiry for a renewal to postpone -- though the
+        COMMAND does expire on 30408, which is why a long slot must re-arm.
+        Kept because the write
         itself is part of the arming sequence and must keep working.
         """
         operation = "timer_renewal"
@@ -1014,6 +1030,7 @@ class CommissioningSession:
         expected_session_id: Optional[str] = None,
         heartbeat=None,
         stale_after_seconds: Optional[float] = None,
+        operator_override: bool = False,
     ) -> CommissioningResult:
         """Release a session this process's PREVIOUS instance left armed.
 
@@ -1034,6 +1051,26 @@ class CommissioningSession:
 
         if not self.backend.commissioning:
             return self._refuse(operation, "backend is not in commissioning mode")
+
+        # Liveness must be PROVED or deliberately WAIVED — never absent by
+        # omission. It used to be skipped whenever heartbeat happened to be
+        # None, which is how the reaper enforced it and the operator path
+        # silently did not.
+        if heartbeat is None and not operator_override:
+            return self._refuse(
+                operation,
+                "no heartbeat was supplied, so it cannot be shown that the "
+                "session's owner is gone — and releasing a LIVE optimizer's "
+                "session is the one thing this must never do. Pass a heartbeat, "
+                "or pass operator_override=True to assert supervision "
+                "deliberately")
+
+        if heartbeat is None and operator_override:
+            self._log(
+                "OPERATOR OVERRIDE: owner liveness is not being used for this "
+                "recovery. You are asserting that no live optimizer owns this "
+                "session. If one does, this will tear it down.",
+                level="CRITICAL")
 
         state = self.backend.reconcile()
         if state is None:
@@ -1096,6 +1133,12 @@ class CommissioningSession:
             if not self._recovery_still_warranted(
                     operation, expected_session_id, heartbeat,
                     stale_after_seconds):
+                # Hand the fence back before returning. A refusal that left the
+                # lease RECOVERING would block the optimizer for the whole
+                # claim TTL -- and the commonest refusal here is "the owner came
+                # back", which means the thing being blocked is alive and well.
+                self.backend.lease.unclaim(expected_session_id,
+                                           claimed.recovery_claim_id)
                 return self.history[-1]
 
         return self._release_and_report(
@@ -1477,7 +1520,7 @@ class CommissioningSession:
         The inverter is handed back on every path out of here, including the
         failing ones. That is not a nicety: the watchdog was expected to catch
         a process that dies mid-test, and on the reference WIT it does not
-        fire at all (see THE WATCHDOG DOES NOT FIRE above). The release in the
+        end the session at all (see WHAT 30408 ACTUALLY BOUNDS above). The release in the
         ``finally`` is the only thing known to end a session.
         """
         operation = "session_test"

@@ -1,7 +1,8 @@
 """Proof that the process holding a session is still running.
 
 The lease says a session was started. It cannot say whether whoever started it
-is still alive to finish it — and since this hardware has no expiry of its own
+is still alive to finish it — and since no expiry ends a SESSION on this
+hardware (30408 bounds the command only)
 (see ``lease.py``), a session whose owner has stopped running is a session that
 never ends.
 

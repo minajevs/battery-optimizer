@@ -59,9 +59,14 @@ run tests two things at once.
 Everything else here assumed a session left alone expires on its own, and
 nothing had observed that happen. It does not: on 2026-09-05 the reference WIT
 held 30407=1 through t=90s of a 60 s window, and only the release ended the
-session. 30408 does not count down either -- it echoes the last value written
--- so neither register describes a timeout, and re-running this is how any
-firmware change to that would be noticed.
+session. 30408 does not count down -- it echoes the last value written.
+
+What 30408 DOES bound is the energetic command, which `duration-test` later
+established: matched runs collapsed the battery effect at t=60s and t=122s for
+durations of 1 and 2 minutes. So a forgotten session stops MOVING ENERGY on
+time while keeping authority, 30407 and the suppression of local battery logic
+-- the house quietly moves onto the grid. Re-running this is how a firmware
+change to either half would be noticed.
 
 Its telemetry answered the other open question the same run. At +1 % the
 battery stopped serving the house: discharge fell from ~460 W to ~110 W and
@@ -567,8 +572,13 @@ def main() -> int:
             release_timeout_seconds=args.release_timeout,
         )
     elif args.operation == "recover":
+        # A person is running this and can see the inverter. Liveness is
+        # WAIVED here rather than absent: recover() refuses outright without
+        # either a heartbeat or this flag, so the operator path has to state
+        # that it is asserting no live optimizer owns the session.
         result = session.recover(wait=make_wait(app),
-                                 release_timeout_seconds=args.release_timeout)
+                                 release_timeout_seconds=args.release_timeout,
+                                 operator_override=True)
     elif args.operation == "strand":
         return strand(app, session, backend, duration_minutes,
                       acknowledged=args.strand_i_will_recover,

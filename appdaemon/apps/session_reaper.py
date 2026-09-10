@@ -2,7 +2,9 @@
 
 A SEPARATE app from the optimizer, deliberately. A hung callback, a crashed
 app or a thread that never returns takes the optimizer's own cleanup with it,
-and this hardware has no expiry that would end the session it leaves behind
+and no expiry ends a SESSION on this hardware — 30408 stops the energetic
+command on time but leaves authority, 30407 and the suppression of local
+battery logic exactly where they were, so the house moves onto the grid
 (see ``control/lease.py``). Nothing inside the optimizer can be the answer to
 the optimizer not running.
 

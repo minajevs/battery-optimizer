@@ -172,7 +172,8 @@ def assess(
     return ReapVerdict(
         True, STRANDED,
         f"30100=1/30407=1 with the heartbeat {age} and a matching lease "
-        f"({lease.describe()}). Nothing in this hardware will end it. "
+        f"({lease.describe()}). No expiry ends a SESSION -- 30408 stops the "
+        f"command, not the ownership. "
         f"Releasing — never resuming")
 
 

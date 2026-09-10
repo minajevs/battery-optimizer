@@ -270,6 +270,20 @@ owner was stale earlier". And **every recovery fences, the manual operator path
 included**, so there is exactly one place allowed to say "this dead session is
 still the same dead session I decided to reap".
 
+Aborts hand the fence back. `unclaim()` is CAS in the same way the claim is,
+and it carries a **`recovery_claim_id` per ATTEMPT** rather than the session id:
+if claim A expires and claim B fences the same session, a resumed process A
+unclaiming by session id alone would drop B's valid fence. It restores
+`previous_state` — `ACQUIRING` or `ACTIVE`, whichever the fence replaced —
+rather than assuming.
+
+**Liveness is proved or deliberately waived, never absent.** `recover()`
+refuses outright unless it is given a heartbeat to check or
+`operator_override=True`. It used to be skipped whenever `heartbeat` happened
+to be `None`, which is how the reaper enforced it and the operator path
+silently did not. `commission.py` now passes the override explicitly and prints
+what the operator is asserting.
+
 The final check before the release requires authority still held — `30100=1` —
 and deliberately NOT exactly `1/1`, because the half-applied arm (`30100=1 /
 30407=0`) is the documented hazard pair and has the strongest claim on being

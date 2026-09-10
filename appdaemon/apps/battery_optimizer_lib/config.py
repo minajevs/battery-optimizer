@@ -139,7 +139,8 @@ class BatteryOptimizerConfig:
     release_settle_seconds: int = 35
     # Where the durable session lease is written. It is the ONLY thing that can
     # tell a restarted process that a session left armed on the inverter is its
-    # own to clean up -- the hardware has no expiry that would end one (see
+    # own to clean up -- no expiry ends a SESSION on this hardware (30408
+    # bounds the energetic command only, see
     # control/lease.py). Empty disables persistence, which means a crash mid-
     # session strands the inverter until someone notices by hand.
     session_lease_path: str = ""
