@@ -196,14 +196,34 @@ The duration is validated before any write: 30408=0 is refused and the accepted
 range is 1-10 minutes, with the renewal delay required to fall after the 30 s
 write cooldown and inside the session it renews.
 
-**There is no hardware watchdog, and 30408 is not one.** `watchdog-test` armed
-30408=1, never renewed, and polled every 5 s: 30407 read 1 at t=90s — half again
-past the window — and only an explicit release ended the session (2026-09-05).
-30408 does not count down either; it echoes the last value written. Treat it as
-a duration field whose enforcement is absent on this firmware. Nothing but a
-release from the owning process, or a supervised recovery, has been observed to
-end a session, so **no duration bounds anything** and every session must be
-watched to its release.
+**30408 bounds the COMMAND, and nothing bounds the SESSION.** These are two
+different facts from two experiments, and conflating them is how the earlier
+"30408 is not a timer at all" reading arose:
+
+1. `watchdog-test` (2026-09-05): 30408=1, never renewed, polled every 5 s —
+   **30407 read 1 at t=90s**, and only an explicit release ended the session.
+   30408 does not count down; it echoes the last value written. Nothing in the
+   hardware releases authority or disarms.
+2. `duration-test` matched pair (2026-09-08), sampling 31200/31201 directly at
+   5 s so the timing does not go through HA's 60 s coordinator poll:
+
+       30408 = 1 min  ->  effect collapsed at t=60 s   (ratio 1.00)
+       30408 = 2 min  ->  effect collapsed at t=122 s  (ratio 1.02)
+
+   The collapse tracks the duration field to within one sample, which rules out
+   a fixed timeout.
+
+So the lifecycle is: the command executes for 30408 minutes, then **the
+energetic effect stops while the session stays armed** — authority still ours,
+local battery logic still suppressed, the house moved onto the grid. The hazard
+is not a runaway battery; it is that energy motion stops while control ownership
+does not revert, and the house silently imports until someone releases.
+
+Two consequences. **Any slot longer than 30408 minutes must re-arm before
+expiry**, or the command silently stops delivering while every register still
+reads armed — which is exactly why EFFECT verification cannot be replaced by
+register read-back. And **every session must still be watched to its release**:
+the duration bounds the command, never the ownership.
 
 **That is what `control/lease.py` exists for.** A durable JSON lease is written
 BEFORE authority is taken and removed only once both halves of a release are

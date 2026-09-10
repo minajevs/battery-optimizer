@@ -72,6 +72,9 @@ REG_TOU_NUM_PERIODS = 30411
 REG_TOU_PERIOD1_BASE = 30412
 REG_SETPOINT_MIRROR = 30474
 REG_PRIORITY_MODE = 30476
+# INPUT registers, not holding: a 32-bit signed pair, x0.1 W,
+# negative = discharging. The fast path for timing experiments.
+REG_BATTERY_POWER = 31200
 
 # Registers the integration rate-limits to one FC06 write per 30 s, each
 # (growatt_modbus.py:1018-1033). The timestamp is stamped on SUCCESS, which is
@@ -115,6 +118,7 @@ COMMISSIONING_ACTIONS = frozenset({
     ControlAction.HOLD,
     ControlAction.PASSTHROUGH,
     ControlAction.DISCHARGE_TO_LOAD,
+    ControlAction.DURATION_PROBE,
 })
 
 # A supervised discharge is a small one. Ten percent of a 12 kW inverter is
@@ -324,6 +328,11 @@ class DryRunExecutor:
     ``can_write`` is False, so the backend never treats a plan as applied.
     """
 
+    @staticmethod
+    def read_battery_power_w():
+        """No I/O in a dry run, so there is no measurement to give."""
+        return None
+
     name = "dry_run"
     can_write = False
     can_read = False
@@ -361,8 +370,16 @@ class _HaRegisterReader:
         self.refused: List[Any] = []
         self.writes: List[Any] = []
 
-    def read_registers(self, start: int, count: int) -> Optional[List[int]]:
-        """Read holding registers via growatt_modbus/get_register_data."""
+    def read_registers(self, start: int, count: int,
+                       register_type: str = "holding") -> Optional[List[int]]:
+        """Read registers via growatt_modbus/get_register_data.
+
+        ``register_type`` matters: the VPP measurement block at 31200 answers
+        only as INPUT registers. Asking for it as holding does not return an
+        error — it times out, three pymodbus retries deep, and a timeout is
+        what makes SharedConn reset the connection. Probing an unmapped range
+        cost ~10 minutes of telemetry on 2026-09-08.
+        """
         if not self.device_id or count <= 0:
             return None
         if count > self.MAX_READ_COUNT:
@@ -374,7 +391,7 @@ class _HaRegisterReader:
                 "growatt_modbus/get_register_data",
                 hass_timeout=self.timeout_seconds,
                 device_id=self.device_id,
-                register_type="holding",
+                register_type=register_type,
                 start_address=start,
                 count=count,
             )
@@ -386,6 +403,31 @@ class _HaRegisterReader:
             return None
 
         return self._extract_values(result, count)
+
+    def read_battery_power_w(self) -> Optional[float]:
+        """Battery power straight from 31200/31201, in watts.
+
+        The HA sensor for this is refreshed only on the coordinator's poll,
+        which is 60 s on this installation — far too coarse to time a
+        transition that may happen at 60 s or 120 s. These two INPUT registers
+        are the same measurement at whatever rate we ask for it.
+
+        A 32-bit signed value across the pair, scaled by 0.1, and already
+        canonical: NEGATIVE IS DISCHARGING (verified 2026-09-06 against SOC
+        movement, and again 2026-09-08 against the HA sensor: raw
+        [65535, 60254] -> -528.2 W while the sensor read -528). It is returned
+        in the RAW convention deliberately — normalisation is the backend's job
+        elsewhere and doing it twice is how a sign gets silently inverted.
+        """
+        registers = self.read_registers(REG_BATTERY_POWER, 2,
+                                        register_type="input")
+        if not registers or len(registers) < 2:
+            return None
+        high, low = registers[0], registers[1]
+        raw = (high << 16) | low
+        if raw >= 0x80000000:
+            raw -= 0x100000000
+        return raw / 10.0
 
     def _refuse(self, step: Any, reason: str) -> StepResult:
         self.refused.append(step)
@@ -747,6 +789,12 @@ class UpstreamVppBackend:
             return abs(command.power_percent)
         if action is ControlAction.HOLD:
             return HOLD_POWER_PERCENT
+        if action is ControlAction.DURATION_PROBE:
+            # Signed like a discharge, but the sign is the caller's to choose:
+            # the experiment is about WHEN the effect stops, not which way it
+            # went, and a negative setpoint is simply the one with a
+            # measurable effect at this SOC.
+            return -abs(command.power_percent)
         if action is ControlAction.MAX_EXPORT:
             return -100
         if action.is_discharge:
@@ -793,6 +841,15 @@ class UpstreamVppBackend:
                     f"{sorted(a.value for a in COMMISSIONING_ACTIONS)})"
                 )
             return self._build_commissioning_plan(command)
+
+        if action is ControlAction.DURATION_PROBE:
+            # Commissioning-only. The normal path would attach an export policy
+            # and AC-charge write to it, which is exactly what the operation
+            # exists to avoid; refusing structurally means a future caller
+            # cannot get one built by accident.
+            raise ValueError(
+                "duration_probe is a supervised commissioning operation and "
+                "has no automatic-control plan")
 
         plan = CommandPlan(action=action)
 
@@ -1643,6 +1700,107 @@ class UpstreamVppBackend:
         detail = f"{detail}; {restored}"
         self._log(f"priority mode probe: {detail}")
         return self.priority_mode_capability, detail
+
+    def read_battery_power_w(self) -> Optional[float]:
+        """Battery power from 31200/31201, or None if this executor cannot.
+
+        Delegates rather than reading directly: the executor seam is what makes
+        every other read substitutable, and a backend that reached past it for
+        one measurement would be the one path a dry run could not intercept.
+        """
+        reader = getattr(self.executor, "read_battery_power_w", None)
+        if reader is None:
+            return None
+        return reader()
+
+    def clear_residual_setpoints(self, state: InverterState):
+        """Return 30200 and 30409 to zero when NO session is armed.
+
+        A released session leaves its command fields behind: this hardware
+        keeps 30409 at whatever was last written and 30200 at whatever the last
+        discharge asked for, and neither is cleared by the release. They are
+        inert while 30100/30407 are 0 — the reference WIT was observed exporting
+        2.3 kW with 30200=1/30201=0 sitting in the registers — but "inert" is
+        not "unambiguous", and a test that starts from a stale setpoint cannot
+        distinguish its own effect from the leftovers of the last one.
+
+        This is a CLEANUP, not a command. It refuses whenever the inverter is
+        doing anything: an armed session owns those registers, and rewriting a
+        live setpoint from a cleanup path is precisely the class of action this
+        project refuses everywhere else. It never touches 30100, 30407 or 30411.
+
+        Returns ``(ok, detail)``.
+        """
+        if state.control_authority is None or state.remote_enabled is None:
+            return False, ("30100/30407 could not be read, so it is not known "
+                           "whether a session is armed; not writing anything")
+        if state.control_authority != 0 or state.remote_enabled != 0:
+            return False, (
+                f"30100={state.control_authority}/30407={state.remote_enabled}: "
+                f"a session is armed and owns these registers. Release it first "
+                f"— a cleanup never rewrites a live setpoint")
+        if state.external_scheduler_present:
+            return False, (
+                f"30411 reports {state.tou_period_count} TOU period(s): another "
+                f"scheduler is loaded, so these registers are not ours to tidy")
+
+        # 30200 is a STORAGE register (EEPROM); 30409 is not. Both are written
+        # only on change, which for 30200 is the difference between one write
+        # and one per invocation.
+        targets = [
+            (REG_EXPORT_LIMIT_ENABLE, state.export_limit_enabled, 0,
+             "export limit"),
+            (REG_REMOTE_POWER, state.commanded_power, 0, "commanded power"),
+        ]
+
+        written, skipped, failed = [], [], []
+        for register, current, target, label in targets:
+            if current is None:
+                failed.append(f"{register} ({label}) could not be read")
+                continue
+            if current == target:
+                skipped.append(f"{register}={target} already")
+                continue
+            result = self._execute_step(RegisterWrite(
+                register, target,
+                note=f"baseline cleanup: {label} {current} -> {target}"))
+            if result is not StepResult.OK:
+                failed.append(f"{register} write {result.value}")
+            else:
+                written.append(f"{register}: {current} -> {target}")
+
+        if not written:
+            detail = "; ".join(skipped + failed) or "nothing to do"
+            return not failed, f"no writes needed — {detail}"
+
+        # Verify from the inverter, never from what we sent. An accepted write
+        # is not a changed register (the 30476 probe exists because of that).
+        after = self.read_state()
+        if after is None:
+            return False, (f"wrote {', '.join(written)} but the inverter could "
+                           f"not be re-read; the change is UNCONFIRMED")
+
+        confirmed, wrong = [], []
+        for register, _, target, label in targets:
+            observed = (after.export_limit_enabled
+                        if register == REG_EXPORT_LIMIT_ENABLE
+                        else after.commanded_power)
+            if observed == target:
+                confirmed.append(f"{register}={observed}")
+            else:
+                wrong.append(f"{register} still reads {observed}, wanted {target}")
+
+        ok = not wrong and not failed
+        detail = f"wrote {', '.join(written)}; read back {', '.join(confirmed)}"
+        if skipped:
+            detail += f"; skipped {', '.join(skipped)}"
+        if wrong:
+            detail += f"; NOT CONFIRMED: {', '.join(wrong)}"
+        if failed:
+            detail += f"; FAILED: {', '.join(failed)}"
+        self._log(f"baseline cleanup: {detail}",
+                  level="INFO" if ok else "ERROR")
+        return ok, detail
 
     def _restore_priority_mode(self, original: int, observed) -> str:
         """Put 30476 back exactly as it was found."""

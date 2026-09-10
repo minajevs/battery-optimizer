@@ -30,6 +30,15 @@ class ControlAction(enum.Enum):
     MAX_EXPORT = "max_export"
     PASSTHROUGH = "passthrough"
 
+    # Commissioning only, and never produced by resolve_action(): a bare timed
+    # override used to ask whether 30408 bounds the ENERGETIC effect of 30409
+    # while the control registers stay armed. It is deliberately NOT a
+    # discharge: is_discharge pulls in the cutoff-SOC write and groups the
+    # action into the discharge effect family, and this operation must write
+    # nothing but 30408/30409/30100/30407. build_plan() refuses it outside
+    # commissioning mode.
+    DURATION_PROBE = "duration_probe"
+
     @property
     def holds_session(self) -> bool:
         """True when the action needs an active VPP session (30100/30407 = 1/1).

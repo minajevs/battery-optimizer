@@ -27,6 +27,13 @@ anywhere near it.
                   recovery. Requires --strand-i-will-recover as well
     release       give the inverter back to its own local logic
     probe         write 30476 to a different value, read it back, restore it
+    duration-test arm 30408=2 / 30409=-3 and watch ~180s: does the ENERGETIC
+                  effect stop near 120s while the registers stay armed?
+                  Writes NOTHING but 30408/30409/30100/30407 — no export
+                  limit, so export is recorded and never judged
+    baseline      put 30200 and 30409 back to 0 so the next test starts
+                  from an unambiguous state. Arms nothing; refuses if a
+                  session is armed or a TOU schedule is loaded
 
 **There is deliberately no standalone `hold` or `renew`.** Ownership of a VPP
 session is process-local: it comes from this process's own successful writes
@@ -142,6 +149,8 @@ from battery_optimizer_lib.control.commissioning import (               # noqa: 
     DEFAULT_COMMISSIONING_MINUTES,
     DEFAULT_DISCHARGE_MIN_SOC,
     DEFAULT_DISCHARGE_OBSERVE_SECONDS,
+    DEFAULT_DURATION_OBSERVE_SECONDS,
+    DEFAULT_DURATION_PROBE_MINUTES,
     DEFAULT_DISCHARGE_PERCENT,
     DEFAULT_WATCHDOG_MINUTES,
     DEFAULT_WATCHDOG_OBSERVE_SECONDS,
@@ -152,7 +161,8 @@ from battery_optimizer_lib.control.commissioning import (               # noqa: 
 # No "hold" and no "renew": see the module docstring. An operation that can
 # only open a session this process cannot close is not offered at all.
 WRITING_OPERATIONS = ("session-test", "watchdog-test", "discharge-test",
-                      "recover", "strand", "probe", "release")
+                      "recover", "strand", "probe", "release", "baseline",
+                      "duration-test")
 
 DEFAULT_LEASE_PATH = os.path.expanduser("~/.battery_optimizer_commission_lease.json")
 DEFAULT_HEARTBEAT_PATH = os.path.expanduser(
@@ -479,16 +489,23 @@ def main() -> int:
 
     duration_minutes = args.duration_minutes
     if duration_minutes is None:
-        duration_minutes = (
-            DEFAULT_WATCHDOG_MINUTES
-            if args.operation in ("watchdog-test", "discharge-test")
-            else DEFAULT_COMMISSIONING_MINUTES)
+        if args.operation == "duration-test":
+            # Two minutes, so the expiry under test falls in the MIDDLE of the
+            # observation rather than at its edge.
+            duration_minutes = DEFAULT_DURATION_PROBE_MINUTES
+        elif args.operation in ("watchdog-test", "discharge-test"):
+            duration_minutes = DEFAULT_WATCHDOG_MINUTES
+        else:
+            duration_minutes = DEFAULT_COMMISSIONING_MINUTES
 
     observe_seconds = args.observe_seconds
     if observe_seconds is None:
-        observe_seconds = (DEFAULT_DISCHARGE_OBSERVE_SECONDS
-                           if args.operation == "discharge-test"
-                           else DEFAULT_WATCHDOG_OBSERVE_SECONDS)
+        if args.operation == "duration-test":
+            observe_seconds = DEFAULT_DURATION_OBSERVE_SECONDS
+        elif args.operation == "discharge-test":
+            observe_seconds = DEFAULT_DISCHARGE_OBSERVE_SECONDS
+        else:
+            observe_seconds = DEFAULT_WATCHDOG_OBSERVE_SECONDS
 
     if args.operation in WRITING_OPERATIONS and not args.confirm:
         print(f"REFUSED: '{args.operation}' writes to the inverter. "
@@ -558,6 +575,16 @@ def main() -> int:
                       heartbeat_path=args.heartbeat_path)
     elif args.operation == "probe":
         result = session.probe_priority_mode()
+    elif args.operation == "baseline":
+        result = session.clear_residuals()
+    elif args.operation == "duration-test":
+        result = session.duration_test(
+            wait=make_wait(app),
+            power_percent=args.power_percent,
+            duration_minutes=duration_minutes,
+            observe_seconds=observe_seconds,
+            min_soc_percent=args.min_soc,
+            release_timeout_seconds=args.release_timeout)
     else:
         result = session.release()
 

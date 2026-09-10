@@ -98,6 +98,7 @@ the thing an interlock blocks.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -164,6 +165,20 @@ DEFAULT_DISCHARGE_EFFECT_W = 150.0
 DEFAULT_EXPORT_TOLERANCE_W = 50.0
 
 DEFAULT_WATCHDOG_MINUTES = MIN_COMMISSIONING_MINUTES
+
+# --- the 30408 timing discriminator ---------------------------------------
+# Two minutes, watched for three, so the expiry (if there is one) falls in the
+# middle of the observation rather than at its edge.
+DEFAULT_DURATION_PROBE_MINUTES = 2
+DEFAULT_DURATION_OBSERVE_SECONDS = 180
+DEFAULT_DURATION_PERCENT = 3
+# The command's effect must be separable from the noise the house makes on its
+# own. This is deliberately larger than the discharge test's threshold: there
+# the question is "did anything happen", here it is "did a thing that was
+# happening stop", which needs the thing to have been unambiguous first.
+DEFAULT_DURATION_EFFECT_W = 250.0
+# How much of the established effect must vanish to count as a collapse.
+DURATION_COLLAPSE_FRACTION = 0.6
 DEFAULT_WATCHDOG_OBSERVE_SECONDS = 90
 DEFAULT_WATCHDOG_POLL_SECONDS = 5
 
@@ -196,13 +211,20 @@ class CommissioningSession:
     state this process fully understands and owns.
     """
 
-    def __init__(self, backend, log_func=None):
+    def __init__(self, backend, log_func=None, clock=None):
         self.backend = backend
         self._log_func = log_func
         self.degraded = False
         self.degraded_reason: Optional[str] = None
         self.history: List[CommissioningResult] = []
         self.observations: List[str] = []
+        # MONOTONIC, and injectable for tests. The timing experiments measure
+        # elapsed time rather than counting nominal poll intervals: a register
+        # read that blocks behind the coordinator's bus lock would otherwise
+        # make the recorded time shorter than the real one, which is precisely
+        # the error that would misplace a collapse.
+        self._clock = clock or time.monotonic
+        self.fast_samples: List[Tuple[float, Optional[float]]] = []
 
     # --- logging ----------------------------------------------------------
 
@@ -410,6 +432,186 @@ class CommissioningSession:
         return None
 
     # --- the four operations ---------------------------------------------
+
+    def duration_test(
+        self,
+        wait,
+        power_percent: int = DEFAULT_DURATION_PERCENT,
+        duration_minutes: int = DEFAULT_DURATION_PROBE_MINUTES,
+        observe_seconds: int = DEFAULT_DURATION_OBSERVE_SECONDS,
+        poll_seconds: int = 5,
+        min_soc_percent: float = DEFAULT_DISCHARGE_MIN_SOC,
+        effect_threshold_w: float = DEFAULT_DURATION_EFFECT_W,
+        release_timeout_seconds: int = DEFAULT_RELEASE_TIMEOUT_SECONDS,
+        state_every_seconds: float = 30.0,
+    ) -> CommissioningResult:
+        """Does 30408 bound the ENERGETIC effect of 30409, while armed?
+
+        The 3 % discharge on 2026-09-05 raised this: at t~60s, with 30408=1,
+        the inverter's output collapsed while 30100/30407/30409 still read
+        1/1/-3, recovering only when the release landed. Either the register
+        state does not expire but the POWER COMMAND does — which would mean an
+        abandoned session stops moving energy without ever handing control back
+        — or something unrelated moved at the same moment.
+
+        This asks the question directly: arm for 2 minutes, watch for 3, and
+        see whether an effect that was clearly established disappears near 120s
+        with every control register unchanged.
+
+        Deliberately NOT ``discharge_test``. That operation answers a ROUTING
+        question ("can we serve the house without exporting?") and writes
+        30200/30201 to constrain the answer. This one answers a TIMING question,
+        writes 30408/30409/30100/30407 and nothing else, and treats export as
+        telemetry rather than as a verdict condition — an unconstrained export
+        target cannot make a timing answer wrong, only a routing one.
+        """
+        operation = "duration_test"
+        self.observations = []
+
+        invalid = self._validate_duration(operation, duration_minutes)
+        if invalid is not None:
+            return invalid
+
+        state, refusal = self._preflight(operation)
+        if refusal is not None:
+            return refusal
+
+        invalid = self._validate_duration_probe(
+            operation, state, power_percent, min_soc_percent,
+            observe_seconds, duration_minutes)
+        if invalid is not None:
+            return invalid
+
+        baseline = self._observe("before ARM", with_power=True)
+        if baseline is None:
+            return self._refuse(
+                operation,
+                "the inverter could not be read before arming, so there is no "
+                "baseline to compare against. A timing verdict needs one")
+
+        # The baseline must be measured the SAME way as the samples it will be
+        # compared against -- mixing a 60 s-stale sensor baseline with 5 s
+        # register samples would put the coordinator's lag into the verdict.
+        baseline_w = self.backend.read_battery_power_w()
+        if baseline_w is None:
+            return self._refuse(
+                operation,
+                "31200/31201 could not be read, so there is no high-resolution "
+                "baseline. Refusing rather than timing against a 60 s sensor")
+        self._log(f"baseline battery power (31200/31201): {baseline_w:+.1f} W")
+
+        command = InverterCommand(
+            action=ControlAction.DURATION_PROBE,
+            power_percent=power_percent,
+            duration_minutes=duration_minutes,
+        )
+
+        result = self.backend.send(command)
+        if result is SendResult.RATE_LIMITED:
+            return self._record(CommissioningResult(
+                operation=operation, ok=False, refused=True,
+                detail="rate-limited by the 30 s write cooldown; nothing sent",
+                state=state))
+        if result is not SendResult.CONFIRMED:
+            self._degrade(f"{operation} returned {result.value}")
+            return self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                f"the duration probe returned {result.value}", steps_ok=False)
+
+        verified = self.backend.verify(command, self.backend.read_state())
+        if verified.unverifiable or not verified.matched:
+            self._degrade(
+                f"{operation} armed but did not read back: {verified.actual}")
+            return self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                f"armed state did not confirm: {verified.actual}",
+                steps_ok=False)
+
+        self._log(f"armed {power_percent}% for {duration_minutes} min "
+                  f"({duration_minutes * 60}s); watching {observe_seconds}s. "
+                  f"Export is RECORDED, not judged.")
+
+        # Fast samples come from 31200/31201 directly. The HA power sensors are
+        # only refreshed on the coordinator's 60 s poll, which cannot resolve a
+        # transition that might be at 60 s or at 120 s -- the whole question.
+        # The control registers are re-read less often: they are needed only to
+        # show the session stayed armed, and every extra service call competes
+        # with the coordinator for the same bus lock.
+        self.fast_samples = []
+        try:
+            started = self._clock()
+            elapsed = 0.0
+            next_state_read = 0.0
+            armed_checks = []
+
+            while elapsed < observe_seconds:
+                # The interval is measured from the START of the pass, so the
+                # read's own cost comes OUT of the wait rather than being added
+                # to it. A register read costs ~0.5 s normally and can cost
+                # seconds behind the coordinator's bus lock; adding that on top
+                # of the interval would stretch a 5 s cadence to 8 s or more
+                # and smear the transition this exists to time.
+                tick = self._clock()
+                watts = self.backend.read_battery_power_w()
+                elapsed = self._clock() - started
+                self.fast_samples.append((round(elapsed, 1), watts))
+
+                if elapsed >= next_state_read:
+                    next_state_read = elapsed + state_every_seconds
+                    st = self._observe(f"t={elapsed:.0f}s", with_power=False)
+                    if st is not None:
+                        armed_checks.append((round(elapsed, 1), st))
+                elif watts is not None:
+                    self._log(f"t={elapsed:5.0f}s  battery {watts:+8.1f} W",
+                              level="DEBUG")
+
+                remaining = poll_seconds - (self._clock() - tick)
+                if remaining > 0:
+                    wait(remaining)
+                elapsed = self._clock() - started
+
+            summary = self._duration_verdict_fast(
+                baseline_w, self.fast_samples, armed_checks,
+                duration_minutes * 60, effect_threshold_w,
+                commanded_percent=-abs(power_percent))
+            self.observations.append(summary)
+            self._log(summary,
+                      level="INFO" if "INCONCLUSIVE" not in summary else "WARNING")
+        except BaseException as e:  # noqa: BLE001 - cleanup must still run
+            summary = (f"observation interrupted by {type(e).__name__}: {e}. "
+                       f"The inverter is being taken off this command before "
+                       f"this returns")
+            self._log(summary, level="ERROR")
+            raise
+        finally:
+            result = self._release_and_report(
+                operation, wait, release_timeout_seconds, poll_seconds,
+                summary, steps_ok=True)
+
+        return result
+
+    def clear_residuals(self) -> CommissioningResult:
+        """Put 30200 and 30409 back to zero so a test starts from a known state.
+
+        Not an energetic operation and not a session: it opens nothing, arms
+        nothing and takes no authority. It exists because a released session
+        leaves its command fields behind on this hardware, and an experiment
+        that begins with a stale setpoint cannot tell its own effect from the
+        residue of the previous one.
+
+        Refuses whenever anything is armed — see
+        ``UpstreamVppBackend.clear_residual_setpoints``.
+        """
+        operation = "clear_residuals"
+        state, refusal = self._preflight(operation)
+        if refusal is not None:
+            return refusal
+
+        ok, detail = self.backend.clear_residual_setpoints(state)
+        if not ok:
+            self._log(f"{operation}: {detail}", level="WARNING")
+        return self._record(CommissioningResult(
+            operation=operation, ok=ok, detail=detail, state=state))
 
     def probe_priority_mode(self) -> CommissioningResult:
         """Find out whether 30476 is genuinely writable, then put it back."""
@@ -867,6 +1069,236 @@ class CommissioningSession:
             steps_ok=True)
 
     # --- the long-lived supervised session test ---------------------------
+
+    def _duration_verdict_fast(self, baseline_w, fast_samples, armed_checks,
+                               expiry_seconds: int, effect_threshold_w: float,
+                               commanded_percent: int) -> str:
+        """Same three stages, but timed from 31200/31201 at ~5 s.
+
+        The only thing this adds over the sensor-based verdict is WHEN, and
+        that is the whole remaining question: 30408=1 collapsing at ~60 s and
+        30408=2 at ~120 s would show the duration field governs the energetic
+        command; both collapsing at the same elapsed time would show a fixed
+        timeout that has nothing to do with 30408. This function reports the
+        collapse time and refuses to interpret it — one run cannot distinguish
+        those, only the matched pair can.
+        """
+        readable = [(t, w) for t, w in fast_samples if w is not None]
+        if len(readable) < 5:
+            return (f"INCONCLUSIVE: only {len(readable)} of "
+                    f"{len(fast_samples)} samples read back from 31200/31201; "
+                    f"not enough to time anything")
+
+        direction = -1.0 if commanded_percent < 0 else 1.0
+
+        def toward(w):
+            return (w - baseline_w) * direction
+
+        early = [(t, w) for t, w in readable
+                 if 0 < t <= min(60, expiry_seconds / 2)]
+        if not early:
+            return "INCONCLUSIVE: no samples in the early window"
+
+        early_effect = max(toward(w) for _t, w in early)
+        if early_effect < effect_threshold_w:
+            return (f"INCONCLUSIVE: largest early movement toward the command "
+                    f"was {early_effect:.0f} W against a "
+                    f"{effect_threshold_w:.0f} W threshold (baseline "
+                    f"{baseline_w:+.0f} W). Expiry cannot be inferred from a "
+                    f"command whose effect was never visible")
+
+        # The collapse line, and the FIRST sustained crossing of it. Sustained
+        # matters: a single low sample is a measurement, two in a row is a
+        # transition, and this signal is noisy at the watt level.
+        line = early_effect * (1 - DURATION_COLLAPSE_FRACTION)
+        collapse_at = None
+        for i in range(len(readable) - 1):
+            if toward(readable[i][1]) < line and toward(readable[i + 1][1]) < line:
+                collapse_at = readable[i][0]
+                break
+
+        armed_throughout = all(
+            st.control_authority == 1 and st.remote_enabled == 1
+            for _t, st in armed_checks) if armed_checks else False
+        registers = ("30100/30407 read 1/1 at every check"
+                     if armed_throughout else
+                     "the control registers did NOT stay armed")
+
+        last = readable[-1][0]
+        if collapse_at is None:
+            return (f"NO_EXPIRY_OBSERVED: effect established "
+                    f"({early_effect:.0f} W toward the command) and never "
+                    f"collapsed through {last:.0f}s, with {registers}. "
+                    f"COLLAPSE_AT=none DURATION={expiry_seconds}s")
+
+        if not armed_throughout:
+            return (f"INCONCLUSIVE: collapse at t={collapse_at:.0f}s but "
+                    f"{registers}, so it says nothing about 30408. "
+                    f"COLLAPSE_AT={collapse_at:.0f}s "
+                    f"DURATION={expiry_seconds}s")
+
+        ratio = collapse_at / expiry_seconds if expiry_seconds else 0.0
+        return (f"COLLAPSE_OBSERVED at t={collapse_at:.0f}s with "
+                f"30408={expiry_seconds // 60} min ({expiry_seconds}s), "
+                f"ratio {ratio:.2f}. Effect was {early_effect:.0f} W toward the "
+                f"command; {registers}. This run alone does NOT say whether "
+                f"30408 governs the timing — compare against a matched run at "
+                f"the other duration. "
+                f"COLLAPSE_AT={collapse_at:.0f}s DURATION={expiry_seconds}s")
+
+    def _validate_duration_probe(self, operation, state, power_percent,
+                                 min_soc_percent, observe_seconds,
+                                 duration_minutes):
+        """Preconditions specific to the timing discriminator.
+
+        The contract requires a genuinely clean start: no export limit and no
+        residual setpoint, because both would make "what changed at 120s"
+        ambiguous. ``--operation baseline`` is what puts them there.
+        """
+        if not 1 <= abs(power_percent) <= MAX_COMMISSIONING_DISCHARGE_PERCENT:
+            return self._refuse(
+                operation,
+                f"power {power_percent}% is outside 1..{MAX_COMMISSIONING_DISCHARGE_PERCENT}%")
+
+        if state.export_limit_enabled not in (0, None):
+            return self._refuse(
+                operation,
+                f"30200={state.export_limit_enabled}: an export limit is set. "
+                f"This operation writes neither 30200 nor 30201, so it would "
+                f"inherit a constraint it did not choose and could not undo. "
+                f"Run --operation baseline first")
+
+        if state.commanded_power not in (0, None):
+            return self._refuse(
+                operation,
+                f"30409={state.commanded_power}: a residual setpoint is still "
+                f"loaded. A timing test must start from 0 or its own effect "
+                f"cannot be told from the last run's. Run --operation baseline")
+
+        if state.soc_percent is None:
+            return self._refuse(
+                operation, "SOC could not be read; not discharging blind")
+        if state.soc_percent < min_soc_percent:
+            return self._refuse(
+                operation,
+                f"SOC {state.soc_percent:.0f}% is below the {min_soc_percent:.0f}% "
+                f"floor for a supervised discharge")
+
+        if observe_seconds <= duration_minutes * 60:
+            return self._refuse(
+                operation,
+                f"observing {observe_seconds}s would end at or before the "
+                f"{duration_minutes * 60}s duration under test, so an expiry "
+                f"could not be seen even if it happened")
+        return None
+
+    def _duration_verdict(self, baseline, samples, expiry_seconds: int,
+                          effect_threshold_w: float,
+                          commanded_percent: int) -> str:
+        """Three stages, in order, and each can only end in its own answer.
+
+        1. Was an effect ESTABLISHED early? Without that, nothing about expiry
+           is knowable and the run is INCONCLUSIVE — you cannot watch a command
+           stop working if it was never shown to work.
+        2. Did that effect COLLAPSE around the expiry, with the registers still
+           armed? Only then does the duration field bound anything.
+        3. Registers are reported either way; a collapse with registers that
+           also changed is not evidence about 30408.
+
+        Export is recorded and never judged: this operation writes no export
+        limit, so where the energy went is not a question it is entitled to
+        answer.
+        """
+        readable = [(t, st) for t, st in samples
+                    if st is not None and st.battery_power_w is not None]
+        if len(readable) < 3:
+            return ("INCONCLUSIVE: battery power was unreadable for most of the "
+                    "run, so no timing conclusion is available")
+
+        base_w = baseline.battery_power_w
+
+        # Movement must be measured TOWARD the commanded direction, never as a
+        # distance from the baseline. The 2026-09-08 run is why: commanded -8%,
+        # the battery went -664 -> -1060 W (working), then collapsed to -142 W
+        # while the house moved onto the grid. As an absolute distance that
+        # collapse scored 522 W -- LARGER than the 396 W of real effect -- so a
+        # distance metric reported the command as still working at its
+        # strongest, which is the exact opposite of what happened.
+        direction = -1.0 if commanded_percent < 0 else 1.0
+
+        def toward_command(state) -> float:
+            """Watts moved in the commanded direction. Negative = moved away."""
+            return (state.battery_power_w - base_w) * direction
+
+        early = [(t, st) for t, st in readable
+                 if 0 < t <= min(60, expiry_seconds // 2)]
+        if not early:
+            return "INCONCLUSIVE: no samples in the early window"
+
+        early_effect = max(toward_command(st) for _t, st in early)
+        if early_effect < effect_threshold_w:
+            return (f"INCONCLUSIVE: the command never produced a distinguishable "
+                    f"effect (largest early movement {early_effect:.0f} W toward "
+                    f"the command, against a {effect_threshold_w:.0f} W "
+                    f"threshold, baseline {base_w:+.0f} W). Expiry cannot be "
+                    f"inferred from a command whose effect was never visible")
+
+        after = [(t, st) for t, st in readable if t >= expiry_seconds + 15]
+        if not after:
+            return (f"INCONCLUSIVE: effect established ({early_effect:.0f} W "
+                    f"toward the command) but the run ended before "
+                    f"{expiry_seconds + 15}s, so the expiry window was never "
+                    f"observed")
+
+        # The LAST samples, not the best of them: the question is where it
+        # ended up, and a max would let one lingering sample hide a collapse.
+        late_effect = sum(toward_command(st) for _t, st in after) / len(after)
+
+        armed_late = [st for _t, st in after
+                      if st.control_authority == 1 and st.remote_enabled == 1]
+        still_armed = len(armed_late) == len(after)
+
+        collapsed = late_effect < early_effect * (1 - DURATION_COLLAPSE_FRACTION)
+        overshot = late_effect < 0
+
+        registers = ("30100/30407 stayed 1/1 throughout" if still_armed
+                     else "the control registers did NOT stay armed")
+
+        # When it collapses, say WHEN as measured -- and how coarsely. HA polls
+        # this inverter about once a minute, so a transition seen at t=95s
+        # happened somewhere in the preceding poll interval. That resolution is
+        # the difference between "tracks 30408" and "a fixed timeout", and it
+        # is not good enough to tell them apart from one run.
+        first_collapse = None
+        for t, st in readable:
+            if t > 0 and toward_command(st) < early_effect * (1 - DURATION_COLLAPSE_FRACTION):
+                first_collapse = t
+                break
+        when = ("" if first_collapse is None else
+                f" First sample below the collapse line: t={first_collapse}s "
+                f"(telemetry is polled ~60s, so the real transition is up to "
+                f"one poll earlier, and the timing does NOT by itself establish "
+                f"that 30408 governs it).")
+
+        if collapsed and still_armed:
+            past = (" It went PAST the baseline: the battery stopped serving "
+                    "the house and the load moved to the grid, a grid-serving "
+                    "standby rather than a return to local logic."
+                    if overshot else "")
+            return (f"SUPPORTS_COMMAND_EXPIRY: effect established "
+                    f"({early_effect:.0f} W toward the command) then collapsed "
+                    f"to {late_effect:.0f} W while {registers}.{past} Evidence "
+                    f"that the ENERGETIC command stops while authority and the "
+                    f"session do NOT -- an abandoned session would stop moving "
+                    f"energy without handing control back.{when}")
+        if collapsed:
+            return (f"INCONCLUSIVE: the effect collapsed ({early_effect:.0f} -> "
+                    f"{late_effect:.0f} W) but {registers}, so this says nothing "
+                    f"about 30408")
+        return (f"NO_EXPIRY_OBSERVED: effect established ({early_effect:.0f} W) "
+                f"and still {late_effect:.0f} W toward the command past "
+                f"{expiry_seconds}s, with {registers}. 30408 does not bound the "
+                f"command on this firmware")
 
     def _observe(self, label: str,
                  with_power: bool = False) -> Optional[InverterState]:

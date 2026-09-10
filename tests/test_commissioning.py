@@ -261,12 +261,37 @@ def test_a_write_failure_is_a_failure():
 # ---------------------------------------------------------------------------
 
 def test_commissioning_transmits_hold_passthrough_and_the_load_discharge_only():
-    """DISCHARGE_TO_LOAD was admitted for the first energetic experiment. The
-    three that buy or sell were not, and admitting one is not a precedent for
-    the others: each needs its own hardware evidence first."""
+    """DISCHARGE_TO_LOAD was admitted for the first energetic experiment, and
+    DURATION_PROBE for the 30408 timing discriminator. The three that buy or
+    sell were not, and admitting one is not a precedent for the others: each
+    needs its own hardware evidence first."""
     assert COMMISSIONING_ACTIONS == {ControlAction.HOLD,
                                      ControlAction.PASSTHROUGH,
-                                     ControlAction.DISCHARGE_TO_LOAD}
+                                     ControlAction.DISCHARGE_TO_LOAD,
+                                     ControlAction.DURATION_PROBE}
+
+
+def test_duration_probe_is_not_a_discharge_and_never_exports():
+    """It must not inherit the cutoff-SOC write or the discharge effect family:
+    the operation writes 30408/30409/30100/30407 and nothing else."""
+    assert ControlAction.DURATION_PROBE.is_discharge is False
+    assert ControlAction.DURATION_PROBE.exports_to_grid is False
+    assert ControlAction.DURATION_PROBE.holds_session is True
+
+
+def test_duration_probe_has_no_automatic_control_plan():
+    """Outside commissioning the normal builder would attach an export policy
+    and an AC-charge write — exactly what this operation exists to avoid."""
+    # A live-mode backend: `commissioning` is derived from the executor, so
+    # the mode is changed the way production would change it.
+    app = FakeApp(clean())
+    config = BatteryOptimizerConfig(device_id="dev", control_mode="live")
+    backend = UpstreamVppBackend(app, config,
+                                 executor=build_executor(app, config))
+    assert backend.commissioning is False
+
+    with pytest.raises(ValueError, match="supervised commissioning operation"):
+        backend.build_plan(InverterCommand(action=ControlAction.DURATION_PROBE))
 
 
 @pytest.mark.parametrize("action", FORBIDDEN_ACTIONS)
