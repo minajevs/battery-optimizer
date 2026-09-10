@@ -583,12 +583,36 @@ observed production, which would otherwise make the ratio read ~1.0.
 
 ### Runtime constraints
 
-**This app needs more than one AppDaemon thread.** `set_wit_mode` is a
-synchronous, blocking service call made from a callback, so on the default
-single thread one slow inverter write stalls schedule execution, the SOC
-listener and PV sampling alike (production: 70 × "Excessive time spent in
-callback (limit=10.0s)" at 10–34 s, all on `thread-0`). Set
-`appdaemon: total_threads: 4` in `appdaemon.yaml` (or pin the app). The app
+**Blocking inverter calls stall this app's other callbacks, and
+`total_threads` does NOT fix that.** A synchronous service call made from a
+callback holds the thread, so one slow inverter write stalls schedule
+execution, the SOC listener and PV sampling alike (production: 70 ×
+"Excessive time spent in callback (limit=10.0s)" at 10–34 s, all on
+`thread-0`).
+
+The earlier advice here — set `appdaemon: total_threads: 4` — cannot achieve
+what it claimed. AppDaemon PINS each app to a single thread by default, so
+every callback of this app runs on that one thread whatever the pool size.
+Worse, `total_threads: 4` together with `pin_apps: false` (global) while the
+app itself stays pinned produces `Invalid thread ID for pinned thread in app:
+battery_optimizer - assigning to thread 0` on every dispatch — the whole app
+back on thread 0, which is the state the setting was meant to avoid
+(observed 2026-09-10).
+
+The two knobs are different names in different files: global `pin_apps` in
+`appdaemon.yaml`, per-app `pin_app` in `apps.yaml`. Unpinning would let this
+app's callbacks run CONCURRENTLY against its mutable state — schedule,
+learning, counters, cost basis, trajectories — so it is not a free win, and
+AppDaemon documents pinning-on as the default for exactly that reason.
+
+**Leave pinning alone unless measurement says otherwise.** On the reference
+installation after the first real deployment, AppDaemon logged zero
+"Excessive time" warnings and the app's own `_timed_callback` instrumentation
+logged none either, with heartbeat gaps at exactly the 30 s interval. The
+threshold that matters is not AppDaemon's conservative 10 s warning but
+`heartbeat_stale_seconds` (90 s): a callback that blocks past that stops the
+heartbeat and the reaper correctly concludes the optimizer is not making
+progress. Fix the blocking call, do not make the orchestrator re-entrant. The app
 instruments its own callbacks via the `_timed_callback` decorator and
 `_record_callback_duration()`, warning above `callback_warn_seconds` and
 repeating the `total_threads` advice once after three overruns. The decorator

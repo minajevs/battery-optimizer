@@ -1349,12 +1349,18 @@ class BatteryOptimizer(hass.Hass):
     def _retry_startup_recovery(self, kwargs=None):
         """Try again to release what the previous instance left armed.
 
-        Only RECOVERY_FAILED retries. RECOVERY_BLOCKED means another instance
-        looks alive and FOREIGN_AUTHORITY means the session was never ours —
-        retrying either would just re-ask a question whose answer needs a
-        person, on a timer.
+        Which states retry is StartupRecovery.should_retry's decision, and
+        asking IT is the point: this guard used to name RECOVERY_FAILED
+        directly, so when INVERTER_UNREADABLE was added the timer was
+        scheduled (should_retry knew about it) and the callback then refused
+        to act (the guard did not). The app sat in INVERTER_UNREADABLE
+        forever, firing a timer that did nothing and logged nothing.
+
+        RECOVERY_BLOCKED means another instance looks alive and
+        FOREIGN_AUTHORITY means the session was never ours; retrying either
+        would re-ask, on a timer, a question whose answer needs a person.
         """
-        if self._lifecycle is not OptimizerLifecycle.RECOVERY_FAILED:
+        if not self._startup.should_retry:
             return
         self._startup = recover_previous_session(
             self._control_backend,

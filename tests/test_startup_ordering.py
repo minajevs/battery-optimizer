@@ -67,10 +67,23 @@ def test_scheduled_execution_is_gated_on_startup_recovery():
         "the startup gate must come before the slot logic, not after it")
 
 
-def test_only_a_failed_recovery_retries():
-    """RECOVERY_BLOCKED and FOREIGN_AUTHORITY need a person, not a timer."""
-    assert "self._startup.should_retry" in SOURCE
-    assert "OptimizerLifecycle.RECOVERY_FAILED" in SOURCE
+def test_the_retry_timer_and_the_retry_guard_agree():
+    """They must both defer to should_retry, or they drift apart.
+
+    They did: should_retry gained INVERTER_UNREADABLE, the guard kept naming
+    RECOVERY_FAILED, and the app sat forever firing a timer that refused to
+    act and logged nothing (live, 2026-09-10).
+    """
+    start = SOURCE.index("    def _retry_startup_recovery(")
+    end = SOURCE.index("\n    def ", start + 1)
+    guard = SOURCE[start:end]
+
+    assert "self._startup.should_retry" in guard, (
+        "the retry guard must ask should_retry, not name a lifecycle itself")
+    assert "OptimizerLifecycle." not in guard.split('"""')[-1], (
+        "no lifecycle may be named in the guard body — that is how it drifted")
+    # And the scheduling side asks the same question.
+    assert SOURCE.count("self._startup.should_retry") >= 2
 
 
 def test_the_heartbeat_is_only_stamped_once_the_lifecycle_is_ready():

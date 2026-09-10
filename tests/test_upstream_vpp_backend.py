@@ -1748,8 +1748,14 @@ def _reader():
 @pytest.mark.parametrize("shape", [
     {"success": True, "values": [1, 2, 3]},                        # bare
     {"response": {"success": True, "values": [1, 2, 3]},
-     "context": {"id": "x"}},                                      # AppDaemon 4.5
+     "context": {"id": "x"}},                                      # REST-ish
     {"result": {"success": True, "values": [1, 2, 3]}},            # older AD
+    # AppDaemon 4.5.13, captured from the real container: the whole websocket
+    # envelope, handler payload TWO wrappers down.
+    {"id": 16, "type": "result", "success": True, "ad_status": "OK",
+     "ad_duration": 0.23,
+     "result": {"context": {"id": "x", "parent_id": None},
+                "response": {"success": True, "values": [1, 2, 3]}}},
 ])
 def test_every_wrapper_the_callers_actually_produce_is_unwrapped(shape):
     reader, _app = _reader()
@@ -1770,3 +1776,15 @@ def test_a_failed_read_says_what_it_got_instead_of_looking_like_a_dead_inverter(
 def test_an_explicit_failure_from_the_handler_is_still_a_failure():
     reader, _app = _reader()
     assert reader._extract_values({"success": False, "values": [1]}, 1) is None
+
+
+def test_a_rejected_service_call_reports_home_assistants_reason():
+    """An envelope-level rejection must not read as an unreadable inverter."""
+    reader, app = _reader()
+    envelope = {"id": 17, "type": "result", "success": False,
+                "error": {"code": "invalid_format",
+                          "message": "not a valid option at 'return_result'"}}
+
+    assert reader._extract_values(envelope, 1) is None
+    assert any("REJECTED by Home Assistant" in m and "return_result" in m
+               for m, _lvl in app.logs)

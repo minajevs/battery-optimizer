@@ -459,11 +459,37 @@ class _HaRegisterReader:
                       f"{type(result).__name__}, not a dict — no values to "
                       f"read", level="WARNING")
             return None
+        # Descend REPEATEDLY, not once. AppDaemon 4.5.13 hands back the whole
+        # websocket envelope, so the handler's payload is two wrappers down:
+        #
+        #   {'id', 'type', 'success', 'ad_status', 'ad_duration',
+        #    'result': {'context': {...},
+        #               'response': {'success': True, 'values': [...]}}}
+        #
+        # An unwrapper that stopped after one hop landed on
+        # {'context', 'response'} and reported "no values" — which is exactly
+        # the shape logged on 2026-09-10, and reads as an unreadable inverter.
+        envelope_error = None
+        if result.get("success") is False and isinstance(result.get("error"), dict):
+            envelope_error = result["error"].get("message")
+
         payload = result
-        for wrapper in ("response", "result"):
-            if "values" not in payload and isinstance(payload.get(wrapper), dict):
-                payload = payload[wrapper]
+        for _ in range(4):                    # bounded: shapes are shallow
+            if "values" in payload:
                 break
+            for wrapper in ("result", "response"):
+                nested = payload.get(wrapper)
+                if isinstance(nested, dict):
+                    payload = nested
+                    break
+            else:
+                break
+
+        if envelope_error is not None:
+            self._log(f"[{self.name}] get_register_data was REJECTED by Home "
+                      f"Assistant: {envelope_error}", level="WARNING")
+            return None
+
         if "values" not in payload:
             self._log(f"[{self.name}] get_register_data response has no "
                       f"'values' — keys were {sorted(payload)[:8]}",
