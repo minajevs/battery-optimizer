@@ -31,3 +31,6 @@ appdaemon/apps/apps.yaml
 
 # git-filter-repo working dir
 .git-rewrite/
+
+# Passive link traces from scripts/link_tracer.py — machine-specific data
+link-trace/
