@@ -150,6 +150,12 @@ class BatteryOptimizerConfig:
     # disables the stamp, which disables the reaper with it.
     heartbeat_path: str = ""
     heartbeat_seconds: int = 30
+    # How old the PREVIOUS instance's heartbeat must be before startup
+    # recovery will release the session it left armed. Should match the
+    # reaper's heartbeat_stale_seconds: the two are answering the same
+    # question about the same file, and a startup that is more eager than the
+    # reaper would release sessions the reaper still considers owned.
+    heartbeat_stale_seconds: float = 90.0
     # "auto" = use register 30476 only if a supervised probe confirmed it is
     # genuinely writable; "never" = never write it.
     priority_mode_write: str = "auto"
@@ -515,6 +521,8 @@ class BatteryOptimizerConfig:
             session_lease_path=args.get("session_lease_path", ""),
             heartbeat_path=args.get("heartbeat_path", ""),
             heartbeat_seconds=int(args.get("heartbeat_seconds", 30)),
+            heartbeat_stale_seconds=float(
+                args.get("heartbeat_stale_seconds", 90)),
             priority_mode_write=args.get("priority_mode_write", "auto"),
             control_mode=args.get("control_mode", "dry_run"),
             use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),

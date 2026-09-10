@@ -291,6 +291,31 @@ cleaned up. Every race abort is loud and NON-LATCHING: a race that resolved in
 the optimizer's favour is information, not a fault, and the next cycle
 reassesses from scratch. `tests/test_recovery_fence.py` covers all of it.
 
+**Startup recovery runs BEFORE the app claims to be alive.** `session_reaper.py`
+documented that "the durable lease and startup recovery clean it up" long
+before anything called `recover()` at startup — the lease, `RECOVERABLE_LEASE`
+and `recover()` all existed, the call did not. So a crash that left the
+inverter armed was cleaned up by nothing, and the restart made it permanent:
+the app came up, stamped a fresh heartbeat, and the reaper read `OWNER_ALIVE`
+— correctly — and refused forever, while the optimizer sat unable to arm over
+`RECOVERABLE_LEASE` and nothing was wrong enough to complain.
+
+The order is the design, because the stamp on disk is evidence about the
+PREVIOUS owner and a fresh one destroys it:
+
+    construct Heartbeat (do NOT stamp)
+    reconcile the inverter and the lease
+    if RECOVERABLE_LEASE: recover, judging liveness by the OLD heartbeat
+    only then stamp, and only then allow scheduled control
+
+`control/startup.py` holds the decision logic and is unit-tested;
+`battery_optimizer.py` is the shell, and `tests/test_startup_ordering.py` pins
+the ordering by reading the source, because no unit test can reach it.
+`OptimizerLifecycle` gates `execute_scheduled_mode`: `RECOVERY_FAILED` retries
+on a timer, while `RECOVERY_BLOCKED` (the previous heartbeat is still fresh, so
+another instance is probably running) and `FOREIGN_AUTHORITY` need a person and
+deliberately do not.
+
 **The second safety layer is `appdaemon/apps/session_reaper.py`.** The lease
 fixes a strand at the next start; it does not fix one while the process stays
 down. So the optimizer stamps a heartbeat on a timer (`heartbeat_path`,

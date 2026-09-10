@@ -19,6 +19,11 @@ from .commissioning import (
 )
 from .heartbeat import Heartbeat
 from .lease import LeaseRecord, SessionLease
+from .startup import (
+    OptimizerLifecycle,
+    StartupRecovery,
+    recover_previous_session,
+)
 from .reaper import ReapVerdict, SessionReaper, assess as assess_stranded_session
 from .upstream_vpp import (
     COMMISSIONING_ACTIONS,
@@ -57,6 +62,9 @@ __all__ = [
     "DEFAULT_WATCHDOG_OBSERVE_SECONDS",
     "DryRunExecutor",
     "Heartbeat",
+    "OptimizerLifecycle",
+    "StartupRecovery",
+    "recover_previous_session",
     "LeaseRecord",
     "ReapVerdict",
     "SessionLease",

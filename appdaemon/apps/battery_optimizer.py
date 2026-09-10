@@ -72,7 +72,10 @@ from battery_optimizer_lib import (
     AmbientServiceConfig,
 )
 from battery_optimizer_lib.control import (
+    CommissioningSession,
     Heartbeat,
+    OptimizerLifecycle,
+    recover_previous_session,
     UpstreamVppBackend,
     build_executor,
 )
@@ -274,10 +277,32 @@ class BatteryOptimizer(hass.Hass):
         )
         self._direct_control = DirectControl(self, self.config, self._control_backend)
         self._log_control_mode_banner()
-        # Seed the backend from what the inverter actually reports, so we do
-        # not rewrite registers that already hold the right value and so an
-        # inherited VPP state is noticed rather than silently built upon.
-        self._control_backend.reconcile()
+        # The heartbeat is CONSTRUCTED here and deliberately NOT stamped: the
+        # stamp on disk right now belongs to the PREVIOUS instance, and it is
+        # the only evidence that that instance is gone. Startup recovery reads
+        # it below; stamping first would destroy it and make a crashed owner
+        # look alive to the reaper forever.
+        self._heartbeat = Heartbeat(self.config.heartbeat_path,
+                                    log_func=self.log)
+
+        # Reconcile, then release anything a previous instance left armed —
+        # before this app claims to be alive and before any scheduled control
+        # can run. All the decision logic is in control/startup.py, which is
+        # unit-tested; this is the shell around it.
+        self._commissioning_session = CommissioningSession(
+            self._control_backend, log_func=self.log)
+        self._startup = recover_previous_session(
+            self._control_backend,
+            self._commissioning_session,
+            self._heartbeat,
+            wait=time.sleep,
+            stale_after_seconds=self.config.heartbeat_stale_seconds,
+            log=self.log,
+        )
+        self._lifecycle = self._startup.lifecycle
+        if not self._startup.ready:
+            self.log(f"scheduled control is DISABLED until startup recovery "
+                     f"clears: {self._startup.detail}", level="CRITICAL")
 
         # Nord Pool price service for fetching electricity prices
         self._price_service = NordPoolPriceService(
@@ -380,8 +405,15 @@ class BatteryOptimizer(hass.Hass):
         # callbacks on purpose: a heartbeat that only ticks when work happens
         # cannot distinguish "idle" from "wedged", and wedged is the case the
         # reaper exists for.
-        self._heartbeat = Heartbeat(self.config.heartbeat_path,
-                                    log_func=self.log)
+        # Constructed above, before startup recovery. Only NOW is it stamped:
+        # everything that needed the previous owner's stamp has read it.
+        if self._startup.should_retry:
+            self.run_every(
+                self._retry_startup_recovery,
+                self.datetime() + datetime.timedelta(seconds=60),
+                60,
+            )
+
         if self._heartbeat.enabled:
             self._heartbeat.stamp()
             self.run_every(
@@ -1302,6 +1334,38 @@ class BatteryOptimizer(hass.Hass):
         return self._sensors.get_float(self.config.pv_power_sensor)
 
     @_timed_callback
+    def _startup_ready(self) -> bool:
+        """Has startup recovery cleared? Logs the reason at most once a slot."""
+        if self._lifecycle is OptimizerLifecycle.READY:
+            return True
+        self.log(f"scheduled control is held off: startup recovery is "
+                 f"{self._lifecycle.value} — {self._startup.detail}",
+                 level="WARNING")
+        return False
+
+    def _retry_startup_recovery(self, kwargs=None):
+        """Try again to release what the previous instance left armed.
+
+        Only RECOVERY_FAILED retries. RECOVERY_BLOCKED means another instance
+        looks alive and FOREIGN_AUTHORITY means the session was never ours —
+        retrying either would just re-ask a question whose answer needs a
+        person, on a timer.
+        """
+        if self._lifecycle is not OptimizerLifecycle.RECOVERY_FAILED:
+            return
+        self._startup = recover_previous_session(
+            self._control_backend,
+            self._commissioning_session,
+            self._heartbeat,
+            wait=time.sleep,
+            stale_after_seconds=self.config.heartbeat_stale_seconds,
+            log=self.log,
+        )
+        self._lifecycle = self._startup.lifecycle
+        if self._startup.ready:
+            self.log("startup recovery cleared; scheduled control is enabled",
+                     level="WARNING")
+
     def _stamp_heartbeat(self, kwargs=None):
         """Say "still alive" for the reaper. Never raises into AppDaemon."""
         self._heartbeat.stamp()
@@ -1446,6 +1510,15 @@ class BatteryOptimizer(hass.Hass):
             force: If True, skip override check (used when manual mode set to "Auto")
         """
         if not self._is_enabled():
+            return
+
+        # Startup recovery gate. A session the previous instance left armed is
+        # released BEFORE this app commands anything; until that clears, the
+        # inverter is not in a state this process understands and owns, and
+        # commanding it would be building on somebody else's authority. The
+        # backend would refuse a session-holding action anyway — this stops it
+        # being attempted, and says why once per slot rather than silently.
+        if not self._startup_ready():
             return
 
         if not force and self._is_override_active():
