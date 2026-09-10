@@ -242,6 +242,41 @@ A recovering process also adopts the 30100 write timestamp from the lease: the
 inverter's 30 s cooldown does not reset because the process that stamped it
 died, and without that the release is refused repeatedly before it lands.
 
+**Recovery is FENCED, and `session_id` is the fencing token.** A reaper
+decides to reap session L1, then spends the inverter's 30 s cooldown getting to
+the write. A restarted optimizer can open and arm L2 inside that window, and
+until 2026-09-10 the reaper would then have released a LIVE session — the one
+thing its own docstring says it must never do. The ownership evidence was "a
+lease exists, names this device, and its setpoint matches the registers", and
+none of that distinguishes L1 from L2: L2's setpoint matches the inverter *by
+construction*, because L2 wrote it. Liveness was checked once, in `assess()`,
+and never again. The window coincides with the most likely recovery event,
+since the reaper fires BECAUSE the optimizer died.
+
+`SessionLease.claim_for_recovery(session_id)` is a compare-and-swap under an
+inter-process lock: the claim lands only if the lease on disk still carries that
+id, and it moves the lease to `RECOVERING`. **`open()` refuses while that claim
+is live**, so a new session cannot be created at all — the fence prevents the
+racing party rather than detecting it afterwards. The claim expires
+(`CLAIM_TTL_SECONDS`) so a reaper that dies mid-recovery cannot lock the
+optimizer out forever.
+
+Three further rules fall out of it. **`send()` refuses to arm when an enabled
+lease will not open** — previously the result was discarded and the plan ran
+anyway, which made the lease advisory at exactly the moment it is meant to be
+binding. **The liveness invariant lives in `recover()`**, not only in
+`assess()`: a function that can write 30100=0 is not callable on "trust me, the
+owner was stale earlier". And **every recovery fences, the manual operator path
+included**, so there is exactly one place allowed to say "this dead session is
+still the same dead session I decided to reap".
+
+The final check before the release requires authority still held — `30100=1` —
+and deliberately NOT exactly `1/1`, because the half-applied arm (`30100=1 /
+30407=0`) is the documented hazard pair and has the strongest claim on being
+cleaned up. Every race abort is loud and NON-LATCHING: a race that resolved in
+the optimizer's favour is information, not a fault, and the next cycle
+reassesses from scratch. `tests/test_recovery_fence.py` covers all of it.
+
 **The second safety layer is `appdaemon/apps/session_reaper.py`.** The lease
 fixes a strand at the next start; it does not fix one while the process stays
 down. So the optimizer stamps a heartbeat on a timer (`heartbeat_path`,

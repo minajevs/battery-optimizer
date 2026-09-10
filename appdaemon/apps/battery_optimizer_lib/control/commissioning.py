@@ -1011,6 +1011,9 @@ class CommissioningSession:
         wait,
         release_timeout_seconds: int = DEFAULT_RELEASE_TIMEOUT_SECONDS,
         poll_seconds: int = 5,
+        expected_session_id: Optional[str] = None,
+        heartbeat=None,
+        stale_after_seconds: Optional[float] = None,
     ) -> CommissioningResult:
         """Release a session this process's PREVIOUS instance left armed.
 
@@ -1062,11 +1065,94 @@ class CommissioningSession:
 
         self._observe("stranded session found", with_power=True)
 
+        # --- the fence -----------------------------------------------------
+        # Everything above decided that a session is recoverable. None of it
+        # establishes that the session is STILL the one that was decided on:
+        # a release waits out the inverter's 30 s cooldown, and a restarted
+        # optimizer can open and arm a new session inside that window. Before
+        # #FENCE this function would then release a live session -- the one
+        # thing the reaper's own docstring says it must never do.
+        # EVERY recovery fences, not just the reaper's. There is one primitive
+        # allowed to say "this dead session is still the same dead session",
+        # and a supervised operator run needs the protection just as much: the
+        # optimizer can restart under a person's recovery too. The reaper
+        # passes the id IT assessed, which is the stronger claim; a manual run
+        # falls back to whatever the lease says right now.
+        if expected_session_id is None:
+            on_disk = self.backend.lease.read()
+            expected_session_id = None if on_disk is None else on_disk.session_id
+
+        if expected_session_id is not None:
+            claimed = self.backend.lease.claim_for_recovery(expected_session_id)
+            if claimed is None:
+                return self._refuse(
+                    operation,
+                    f"session {expected_session_id} could not be fenced for "
+                    f"recovery: the lease is gone, belongs to a different "
+                    f"session, or is already being recovered. Something "
+                    f"changed since this was assessed, so nothing here is ours "
+                    f"to release")
+
+            if not self._recovery_still_warranted(
+                    operation, expected_session_id, heartbeat,
+                    stale_after_seconds):
+                return self.history[-1]
+
         return self._release_and_report(
             operation, wait, release_timeout_seconds, poll_seconds,
             "recovering a session left armed by a previous instance; it is "
             "being released, NOT resumed",
             steps_ok=True)
+
+    def _recovery_still_warranted(self, operation, session_id, heartbeat,
+                                  stale_after_seconds) -> bool:
+        """The final check, after the fence and before the release write.
+
+        The fence already makes a new owner impossible, so this should never
+        fail. It exists because the write it guards is 30100=0 on real
+        hardware, and "should never" is not the standard that write is held to.
+        Every failure here is LOUD and NON-LATCHING: the next cycle reassesses
+        from scratch, because a race that resolved in the optimizer's favour is
+        information, not a fault.
+        """
+        if not self.backend.lease.verify_claim(session_id):
+            self._refuse(operation,
+                         f"the recovery claim on {session_id} did not hold at "
+                         f"the final check; NOT releasing")
+            return False
+
+        if heartbeat is not None and stale_after_seconds is not None:
+            age = heartbeat.age()
+            if age is not None and age <= stale_after_seconds:
+                self._refuse(
+                    operation,
+                    f"the owner came back: the heartbeat is {age:.0f}s old "
+                    f"against a {stale_after_seconds:.0f}s staleness bar. "
+                    f"Releasing now would tear down a LIVE session. Aborting "
+                    f"the recovery — the lease stays fenced only until this "
+                    f"returns, and the next cycle will reassess")
+                return False
+
+        state = self.backend.read_state()
+        if state is None:
+            self._refuse(operation,
+                         "the inverter became unreadable between the fence and "
+                         "the release; NOT writing blind")
+            return False
+        # Authority is the thing a release revokes, so authority is what must
+        # still be held. Deliberately NOT "still exactly 1/1": the half-applied
+        # arm (30100=1 / 30407=0) is the documented hazard pair and is exactly
+        # what recovery exists to clean up, so demanding 1/1 here would refuse
+        # the case with the strongest claim on being cleaned up.
+        if state.control_authority != 1:
+            self._refuse(
+                operation,
+                f"the inverter now reads 30100={state.control_authority}/"
+                f"30407={state.remote_enabled}: authority is no longer held, "
+                f"so the session ended without us and there is nothing to "
+                f"release")
+            return False
+        return True
 
     # --- the long-lived supervised session test ---------------------------
 

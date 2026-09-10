@@ -202,6 +202,7 @@ class SessionReaper:
         self.reap_failed = 0
         self.alarm_count = 0
         self.reaping = False
+        self.assessed_session_id: Optional[str] = None
 
     def _log(self, message: str, level: str = "INFO") -> None:
         if self._log_func is not None:
@@ -214,10 +215,17 @@ class SessionReaper:
 
     def check(self) -> ReapVerdict:
         """One cycle: read, decide, remember. Never writes to the inverter."""
+        lease = self.backend.lease.read()
+        # The id of the session THIS decision was made about. Everything after
+        # this point acts on that id, never on "whatever lease is there now" --
+        # the two stop being the same thing the moment a restarted optimizer
+        # opens a new one, which is precisely what a recovery's cooldown wait
+        # gives it time to do.
+        self.assessed_session_id = None if lease is None else lease.session_id
         verdict = assess(
             heartbeat_age=self.heartbeat.age(),
             stale_after_seconds=self.stale_after_seconds,
-            lease=self.backend.lease.read(),
+            lease=lease,
             state=self.backend.read_state(),
             device_id=self.device_id,
         )
@@ -253,10 +261,18 @@ class SessionReaper:
 
         self.reaping = True
         try:
-            # recover() re-reads the inverter and re-consults the lease itself,
-            # and refuses unless the backend independently reached
-            # RECOVERABLE_LEASE. Nothing here can talk it past that.
-            result = self.session.recover(wait=wait)
+            # recover() FENCES the assessed session first: the lease is
+            # claimed by id, which stops a restarted optimizer opening a new
+            # one while the release waits out the inverter's cooldown. It then
+            # re-reads the inverter, re-consults the lease, and re-checks the
+            # heartbeat before writing. Nothing here can talk it past any of
+            # that, and it refuses unless the backend independently reached
+            # RECOVERABLE_LEASE.
+            result = self.session.recover(
+                wait=wait,
+                expected_session_id=self.assessed_session_id,
+                heartbeat=self.heartbeat,
+                stale_after_seconds=self.stale_after_seconds)
             if result.ok and self.backend.session_state is SessionState.RELEASED:
                 self.reap_count += 1
                 self.last_reap_at = self._now()

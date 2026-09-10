@@ -34,10 +34,13 @@ being defended against can land between any two instructions.
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -47,6 +50,17 @@ from typing import Optional
 ACQUIRING = "acquiring"
 ACTIVE = "active"
 RELEASING = "releasing"
+# A reaper has FENCED this lease for recovery. While a lease is in this state
+# no new session may be opened against it: the point is not to notice that a
+# new owner appeared, it is to make one impossible while a release is in
+# flight. See claim_for_recovery().
+RECOVERING = "recovering"
+
+# How long a recovery claim is honoured. A reaper that dies mid-recovery must
+# not lock the optimizer out forever, so the claim expires -- generously,
+# because a real recovery waits out the inverter's 30 s cooldown and then a
+# settle, and breaking a live claim is far worse than waiting.
+CLAIM_TTL_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +82,9 @@ class LeaseRecord:
     # could have predicted -- observed on hardware as ten rejected writes
     # before the 30 s window cleared.
     authority_written_at: Optional[float] = None
+    # When a reaper fenced this lease for recovery. Only meaningful
+    # while state == RECOVERING.
+    claimed_at: Optional[float] = None
 
     def describe(self) -> str:
         age = max(0, int(time.time() - self.started_at))
@@ -103,6 +120,56 @@ class SessionLease:
     def enabled(self) -> bool:
         return bool(self.path)
 
+    @contextmanager
+    def _exclusive(self):
+        """Hold an inter-process lock across a read-modify-write of the lease.
+
+        os.replace() makes each WRITE atomic, which is not the same thing: the
+        dangerous sequence here is read-decide-write, and two processes can
+        interleave inside it. The reaper deciding "this lease is still L1" and
+        the optimizer deciding "there is no lease, I may open L2" are exactly
+        that pair, and the window between them is the ~30 s cooldown a recovery
+        must wait out.
+
+        The lock lives in a sidecar file, never the lease itself, because the
+        lease is replaced by rename and a lock held on the old inode would
+        protect nothing. If locking is unavailable the operation still runs --
+        an unlocked lease is what this project had before, so degrading to it
+        is not a new hazard -- but it says so.
+        """
+        if not self.path:
+            yield False
+            return
+        lock_path = f"{self.path}.lock"
+        handle = None
+        try:
+            directory = os.path.dirname(os.path.abspath(lock_path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            handle = open(lock_path, "a+")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield True
+        except OSError as e:
+            if handle is not None and e.errno not in (errno.EACCES, errno.EAGAIN):
+                self._log(f"lease lock unavailable ({e}); proceeding UNLOCKED",
+                          level="WARNING")
+            yield False
+        finally:
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                handle.close()
+
+    def _claim_is_live(self, record: Optional[LeaseRecord]) -> bool:
+        """Is this lease fenced for a recovery that is still plausibly running?"""
+        if record is None or record.state != RECOVERING:
+            return False
+        if record.claimed_at is None:
+            return True
+        return (self._clock() - record.claimed_at) < CLAIM_TTL_SECONDS
+
     def read(self) -> Optional[LeaseRecord]:
         """The lease on disk, or None. Never raises."""
         if not self.path:
@@ -133,6 +200,7 @@ class SessionLease:
                 updated_at=float(data.get("updated_at", 0.0)),
                 pid=data.get("pid"),
                 authority_written_at=data.get("authority_written_at"),
+                claimed_at=data.get("claimed_at"),
             )
         except Exception as e:  # noqa: BLE001 - same reasoning
             self.last_error = str(e)
@@ -171,7 +239,112 @@ class SessionLease:
     def open(self, device_id: str, action: str = "",
              setpoint_percent: Optional[int] = None,
              duration_minutes: Optional[int] = None) -> Optional[LeaseRecord]:
-        """Record the intent to take authority. Called BEFORE the first write."""
+        """Record the intent to take authority. Called BEFORE the first write.
+
+        REFUSES while the existing lease is fenced for recovery. That refusal
+        is the whole point of the fence: a reaper that has decided to release
+        session L1 spends the inverter's 30 s cooldown getting there, and if a
+        restarted optimizer could open L2 inside that window the reaper's
+        release would land on a live session. Detecting the new owner
+        afterwards is not enough -- by then both have acted.
+
+        Returns None when refused, and the caller MUST NOT arm on None. An
+        enabled lease that could not be opened means there is no durable record
+        of what is about to be done, which is the exact failure this file
+        exists to prevent.
+        """
+        with self._exclusive():
+            existing = self.read()
+            if self._claim_is_live(existing):
+                age = ("unknown" if existing.claimed_at is None
+                       else f"{self._clock() - existing.claimed_at:.0f}s")
+                self.last_error = "fenced for recovery"
+                self._log(
+                    f"REFUSED to open a lease: session {existing.session_id} "
+                    f"is fenced for recovery (claimed {age} ago). Something is "
+                    f"releasing it right now, and arming on top would give it "
+                    f"a live session to tear down. Not arming.",
+                    level="CRITICAL")
+                return None
+            if existing is not None and existing.state == RECOVERING:
+                self._log(
+                    f"a recovery claim on session {existing.session_id} has "
+                    f"expired (older than {CLAIM_TTL_SECONDS:.0f}s); treating "
+                    f"the lease as abandoned and opening a new one. Whatever "
+                    f"claimed it did not finish — check for a stranded "
+                    f"session.", level="ERROR")
+            return self._open_locked(device_id, action, setpoint_percent,
+                                     duration_minutes)
+
+    def claim_for_recovery(self, session_id: str) -> Optional[LeaseRecord]:
+        """Fence a lease for recovery, but ONLY if it is still the one decided on.
+
+        A compare-and-swap: the claim lands only when the lease on disk still
+        carries ``session_id``. That makes the id a fencing token rather than
+        one more precondition — after this returns a record, no new session can
+        be opened until the claim is released or expires, so the "is it still
+        the same dead session?" question cannot change its answer underneath
+        the release.
+
+        Returns None when the lease is gone, belongs to a different session, or
+        is already claimed by someone else.
+        """
+        with self._exclusive():
+            existing = self.read()
+            if existing is None:
+                self._log(f"cannot claim {session_id}: there is no lease",
+                          level="WARNING")
+                return None
+            if existing.session_id != session_id:
+                self._log(
+                    f"REFUSING to claim {session_id}: the lease now carries "
+                    f"{existing.session_id}. A different session exists, so "
+                    f"the one that was assessed is gone and nothing here is "
+                    f"ours to release.", level="ERROR")
+                return None
+            if self._claim_is_live(existing) :
+                self._log(
+                    f"session {session_id} is already fenced for recovery; "
+                    f"leaving it to whoever claimed it", level="WARNING")
+                return None
+
+            fields = {**asdict(existing), "state": RECOVERING,
+                      "claimed_at": self._clock(),
+                      "updated_at": self._clock()}
+            claimed = LeaseRecord(**fields)
+            if not self._write(claimed):
+                return None
+            self._log(f"FENCED for recovery: {claimed.describe()}. No new "
+                      f"session may be opened until this is released.")
+            return claimed
+
+    def verify_claim(self, session_id: str) -> bool:
+        """Is this still our claim, immediately before we act on it?
+
+        Defence in depth behind the fence: ``open()`` already refuses while the
+        claim is live, so this should never fail in practice. It exists because
+        the write it guards is 30100=0 on hardware, and "should never" is not
+        the standard that write is held to.
+        """
+        with self._exclusive():
+            existing = self.read()
+            if existing is None:
+                self._log(f"claim on {session_id} is GONE: the lease no longer "
+                          f"exists", level="ERROR")
+                return False
+            if existing.session_id != session_id:
+                self._log(f"claim on {session_id} is STALE: the lease now "
+                          f"carries {existing.session_id}", level="ERROR")
+                return False
+            if existing.state != RECOVERING:
+                self._log(f"claim on {session_id} was released: the lease "
+                          f"reads {existing.state}", level="ERROR")
+                return False
+            return True
+
+    def _open_locked(self, device_id: str, action: str,
+                     setpoint_percent: Optional[int],
+                     duration_minutes: Optional[int]) -> Optional[LeaseRecord]:
         record = LeaseRecord(
             session_id=uuid.uuid4().hex,
             device_id=str(device_id),

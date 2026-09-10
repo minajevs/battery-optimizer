@@ -3,6 +3,7 @@ Pytest configuration and shared fixtures for battery optimizer tests.
 """
 
 import datetime
+import pathlib
 import sys
 from pathlib import Path
 from typing import List
@@ -12,6 +13,9 @@ import pytest
 # Add the apps directory to path for imports
 APPS_DIR = Path(__file__).parent.parent / "appdaemon" / "apps"
 sys.path.insert(0, str(APPS_DIR))
+# The tests directory too, so a test module can reuse another's fakes rather
+# than growing a second copy that drifts from the first.
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 # Create mock appdaemon module before importing battery_optimizer
 mock_hass_module = type(sys)("appdaemon.plugins.hass.hassapi")

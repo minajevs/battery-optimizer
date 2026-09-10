@@ -1099,6 +1099,25 @@ class UpstreamVppBackend:
                 setpoint_percent=command.power_percent,
                 duration_minutes=command.duration_minutes)
 
+            # An ENABLED lease that would not open means either a reaper has
+            # fenced this session for recovery, or the record could not be
+            # written at all. Both are refusals to arm, and the result was
+            # previously discarded: the plan ran either way, which made the
+            # lease advisory at exactly the moments it is meant to be binding.
+            # A disabled lease returns None legitimately and is not this case.
+            if self.lease.enabled and self._lease_record is None:
+                self._counters["lease_refusals"] = (
+                    self._counters.get("lease_refusals", 0) + 1)
+                reason = self.lease.last_error or "unknown"
+                self._log(
+                    f"REFUSING to arm {command.action.value}: the durable "
+                    f"lease could not be opened ({reason}). Arming without a "
+                    f"record is the failure the lease exists to prevent, and a "
+                    f"fenced lease means something is releasing this session "
+                    f"right now.",
+                    level="CRITICAL")
+                return SendResult.FAILED
+
         result = self._execute_plan(plan)
 
         if result is SendResult.CONFIRMED and command.action.holds_session:
