@@ -111,3 +111,45 @@ def test_initialize_stamps_through_the_guarded_helper_not_directly():
     assert "self._heartbeat.stamp()" not in body, (
         "initialize() must stamp via _stamp_heartbeat(), which enforces READY")
     assert "self._stamp_heartbeat()" in body
+
+
+def test_liveness_is_published_only_from_the_ready_gated_stamp():
+    """The sensor is the watcher's only view of this app, so it must carry the
+    same meaning as the heartbeat file: alive AND owning its session properly.
+    Publishing it from anywhere ungated would make a stuck app look healthy."""
+    start = SOURCE.index("    def _stamp_heartbeat(")
+    end = SOURCE.index("\n    def _publish_liveness(")
+    body = SOURCE[start:end]
+
+    guard = body.index("OptimizerLifecycle.READY")
+    publish = body.index("self._publish_liveness()")
+    assert guard < publish, "the READY guard must precede the publish"
+    assert SOURCE.count("self._publish_liveness()") == 1, (
+        "one call site only — a second could bypass the gate")
+
+
+def test_the_liveness_state_changes_every_beat():
+    """A constant state ('ready') is indistinguishable from a stopped app in
+    HA's recorder, which stores state CHANGES. That trap already produced a
+    phantom stall once while diagnosing the Modbus link."""
+    start = SOURCE.index("    def _publish_liveness(")
+    end = SOURCE.index("\n    def ", start + 1)
+    body = SOURCE[start:end]
+
+    assert "state=self.datetime().isoformat()" in body, (
+        "the state must be the timestamp, not a constant")
+    assert "lifecycle" in body and "pid" in body and "control_mode" in body
+
+
+def test_publishing_cannot_break_the_heartbeat():
+    """The file is what the reaper reads and is the more important of the two."""
+    start = SOURCE.index("    def _publish_liveness(")
+    end = SOURCE.index("\n    def ", start + 1)
+    body = SOURCE[start:end]
+    assert "except Exception" in body
+
+    stamp_start = SOURCE.index("    def _stamp_heartbeat(")
+    stamp_body = SOURCE[stamp_start:SOURCE.index("\n    def _publish_liveness(")]
+    assert stamp_body.index("self._heartbeat.stamp()") < \
+        stamp_body.index("self._publish_liveness()"), (
+        "stamp the file first; the sensor is the derived signal")

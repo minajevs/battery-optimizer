@@ -11,6 +11,7 @@ import appdaemon.plugins.hass.hassapi as hass
 import datetime
 import functools
 import math
+import os
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -83,6 +84,9 @@ from battery_optimizer_lib.direct_control import ApplyOutcome
 from battery_optimizer_lib.models import ScheduleModeCounts, count_schedule_modes
 from battery_optimizer_lib.pv_profile import PvProfile
 from battery_optimizer_lib.slot_outcome_tracker import SlotOutcomeTracker
+
+
+LIVENESS_SENSOR = "sensor.battery_optimizer_liveness"
 
 
 def _timed_callback(func):
@@ -1393,6 +1397,40 @@ class BatteryOptimizer(hass.Hass):
         if self._lifecycle is not OptimizerLifecycle.READY:
             return
         self._heartbeat.stamp()
+        self._publish_liveness()
+
+    def _publish_liveness(self) -> None:
+        """Mirror the heartbeat into HA, for a watcher outside AppDaemon.
+
+        The file is invisible to Home Assistant — it lives in the ADD-ON's
+        config directory, not HA's — so a native automation cannot read it.
+        A sensor crosses that boundary without inventing a shared mount.
+
+        The STATE is the timestamp, not "ready": HA's recorder stores state
+        CHANGES, so a constant state would look identical to a stopped app
+        (the same trap that produced a phantom stall while diagnosing the
+        Modbus link). A changing state makes both `last_reported` and the
+        recorder's history usable.
+
+        Publishing must never be able to break the heartbeat: the file is what
+        the reaper reads, and it is the more important of the two.
+        """
+        try:
+            self.set_state(
+                LIVENESS_SENSOR,
+                state=self.datetime().isoformat(),
+                attributes={
+                    "lifecycle": self._lifecycle.value,
+                    "pid": os.getpid(),
+                    "control_mode": self.config.control_mode,
+                    "heartbeat_seconds": self.config.heartbeat_seconds,
+                    "friendly_name": "Battery Optimizer Liveness",
+                    "icon": "mdi:heart-pulse",
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - never take the heartbeat down
+            self.log(f"could not publish {LIVENESS_SENSOR}: {e}",
+                     level="WARNING")
 
     @_timed_callback
     def _sample_pv(self, kwargs=None):

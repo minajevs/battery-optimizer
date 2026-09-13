@@ -1,0 +1,115 @@
+# Native Home Assistant watcher for a dead AppDaemon.
+#
+# The ONLY thing this knows about is whether the optimizer is still reporting.
+# It contains NO inverter semantics: no registers, no lease, no session. If the
+# add-on is dead it restarts it, and AppDaemon's own startup recovery — the
+# fenced primitive proved on hardware — deals with anything left armed. Safety
+# logic stays in tested Python, never in YAML.
+#
+# WHY THE THRESHOLD IS 5 MINUTES AND NOT 2
+# ----------------------------------------
+# Measured on this installation, 2026-09-11 and 09-12: when HA Core restarts,
+# AppDaemon loses its websocket and cannot publish for 120 s and 172 s
+# respectively -- while being perfectly healthy, reconnecting and reaching
+# READY on its own both times. From HA's side that is INDISTINGUISHABLE from a
+# dead add-on: both sensors go stale either way, so watching two sensors does
+# not separate the cases. Only time does.
+#
+# So: 5 minutes of staleness, and the trigger must HOLD for 2 more. A Core
+# restart breaks the condition as soon as AppDaemon reconnects (~30 s later),
+# which resets the timer. That is also comfortably longer than the reaper's own
+# 90 s bar, so an optimizer-only crash gets dealt with inside AppDaemon before
+# HA considers restarting the whole add-on underneath a running recovery.
+
+template:
+  - sensor:
+      - name: "Battery Optimizer Liveness Age"
+        unique_id: battery_optimizer_liveness_age
+        unit_of_measurement: s
+        state_class: measurement
+        # last_reported, not last_changed: the optimizer publishes a changing
+        # timestamp so either would work, but last_reported is the one that
+        # stays correct if that ever becomes a constant.
+        state: >
+          {% set s = states.sensor.battery_optimizer_liveness %}
+          {{ 99999 if s is none else (now() - s.last_reported).total_seconds() | round(0) }}
+        availability: "{{ states('sensor.battery_optimizer_liveness') not in ['unknown'] }}"
+
+      - name: "Battery Session Reaper Age"
+        unique_id: battery_session_reaper_age
+        unit_of_measurement: s
+        state_class: measurement
+        state: >
+          {% set s = states.sensor.battery_session_reaper %}
+          {{ 99999 if s is none else (now() - s.last_reported).total_seconds() | round(0) }}
+
+input_datetime:
+  ha_last_started:
+    name: Home Assistant last started
+    has_date: true
+    has_time: true
+
+automation:
+  - id: battery_optimizer_record_ha_start
+    alias: "Battery: record when Home Assistant started"
+    description: >
+      The watchdog needs to know whether Home Assistant itself has just come
+      back, because AppDaemon's published entities do not survive a Core
+      restart and their absence is indistinguishable from a dead add-on.
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.ha_last_started
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  - id: battery_optimizer_restart_dead_appdaemon
+    alias: "Battery: restart AppDaemon when the optimizer stops reporting"
+    description: >
+      Restarts the AppDaemon add-on when BOTH AppDaemon-published sensors have
+      gone quiet for long enough that a Home Assistant Core restart cannot
+      explain it. Knows nothing about the inverter.
+    mode: single
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.battery_optimizer_liveness_age
+        above: 300
+        for: "00:02:00"
+    condition:
+      # Both signals quiet. If the reaper is still reporting then AppDaemon is
+      # alive and only the optimizer app is unhealthy -- the reaper is the
+      # right layer for that, and restarting the add-on could land underneath
+      # a recovery it is in the middle of.
+      - condition: numeric_state
+        entity_id: sensor.battery_session_reaper_age
+        above: 300
+      # Never act while Home Assistant is itself still settling. This guard is
+      # NOT optional: AppDaemon's set_state entities do not survive an HA
+      # restart, so the moment Core comes back the liveness sensor is MISSING
+      # and its age reads as infinite -- identical to a dead add-on. An earlier
+      # draft conditioned on sensor.uptime, which does not exist on this
+      # installation, so the condition silently evaluated to true and the guard
+      # did nothing at all. input_datetime.ha_last_started is set by the
+      # companion automation below and cannot go missing the same way.
+      - condition: template
+        value_template: >
+          {% set started = states('input_datetime.ha_last_started') %}
+          {{ started not in ['unknown', 'unavailable']
+             and (now() - as_local(as_datetime(started))).total_seconds() > 600 }}
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "Battery optimizer: restarting AppDaemon"
+          message: >
+            No report from the optimizer for
+            {{ states('sensor.battery_optimizer_liveness_age') }}s or the reaper
+            for {{ states('sensor.battery_session_reaper_age') }}s. Restarting
+            the add-on; AppDaemon's own startup recovery will release anything
+            left armed.
+      - service: hassio.addon_restart
+        data:
+          addon: a0d7b954_appdaemon
