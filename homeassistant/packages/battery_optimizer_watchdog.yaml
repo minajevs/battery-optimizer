@@ -33,7 +33,11 @@ template:
         state: >
           {% set s = states.sensor.battery_optimizer_liveness %}
           {{ 99999 if s is none else (now() - s.last_reported).total_seconds() | round(0) }}
-        availability: "{{ states('sensor.battery_optimizer_liveness') not in ['unknown'] }}"
+        # NO availability template here on purpose. Gating availability on the
+        # liveness sensor existing would make this sensor UNAVAILABLE exactly
+        # when the optimizer is gone -- which is the case the watchdog exists
+        # for -- so numeric_state would never fire. A missing sensor must read
+        # as an enormous age, not as "no opinion".
 
       - name: "Battery Session Reaper Age"
         unique_id: battery_session_reaper_age
