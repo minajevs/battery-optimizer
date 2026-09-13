@@ -361,3 +361,131 @@ def assess_renewal(
                                "the command is past its renewal point")
 
     return RenewalDecision(RenewalAction.WAIT, "not yet due")
+
+
+class RenewalRunner:
+    """Drives CommandRenewal from one-shot timers. Free of AppDaemon.
+
+    The orchestrator supplies four callables and four questions; this owns the
+    sequencing. Keeping it here rather than in ``battery_optimizer.py`` is the
+    point: the orchestrator has no unit tests, and "a stale callback writes
+    nothing" is a claim that has to be provable against a real backend rather
+    than against a decision function that merely says DROP.
+
+    **One-shot timers, never a repeating one.** Renewal timing belongs to the
+    last confirmed TTL, so each successful renewal establishes the next
+    deadline. A periodic timer would be a second clock, free to drift away from
+    the TTL clock the policy was deliberately tied to.
+
+    **Cancellation cancels the timer FIRST, then invalidates the generation.**
+    Either alone is insufficient: AppDaemon may already have queued the
+    callback (so cancelling the timer does not stop it), and a callback that
+    outruns the cancel must still find a generation that no longer matches.
+    """
+
+    def __init__(self, renewal: "CommandRenewal", *, schedule, cancel_timer,
+                 send, release, lifecycle_ready, automatic_writes_allowed,
+                 session_active, log_func=None, retry_seconds: float = 15.0):
+        self.renewal = renewal
+        self._schedule = schedule            # (delay_seconds, generation) -> handle
+        self._cancel_timer = cancel_timer    # (handle) -> None
+        self._send = send                    # (command) -> bool confirmed
+        self._release = release              # () -> None
+        self._lifecycle_ready = lifecycle_ready
+        self._automatic = automatic_writes_allowed
+        self._session_active = session_active
+        self._log_func = log_func
+        self.retry_seconds = float(retry_seconds)
+
+        self.handle = None
+        self.active_command = None
+        self.releases = 0
+
+    def _log(self, message: str, level: str = "INFO") -> None:
+        if self._log_func is not None:
+            self._log_func(f"[renewal] {message}", level=level)
+
+    # --- lifecycle --------------------------------------------------------
+
+    def command_armed(self, command) -> int:
+        """A command was CONFIRMED armed. Start its TTL and schedule the check."""
+        self.cancel("superseded by a new command")
+        generation = self.renewal.record_armed()
+        self.active_command = command
+        self._arm_timer(generation)
+        return generation
+
+    def cancel(self, reason: str = "") -> int:
+        """Idempotent. The FIRST operation in every path that ends a command."""
+        if self.handle is not None:
+            try:
+                self._cancel_timer(self.handle)
+            except Exception as e:  # noqa: BLE001 - cancelling must not raise
+                self._log(f"could not cancel the renewal timer: {e}",
+                          level="WARNING")
+            self.handle = None
+        generation = self.renewal.cancel(reason)
+        self.active_command = None
+        return generation
+
+    def _arm_timer(self, generation: int) -> None:
+        remaining_to_due = (self.renewal.ttl_seconds * self.renewal.renew_fraction
+                            - (self.renewal.age() or 0.0))
+        delay = max(1.0, remaining_to_due)
+        self.handle = self._schedule(delay, generation)
+
+    # --- the callback -----------------------------------------------------
+
+    def on_timer(self, generation: Optional[int] = None) -> RenewalDecision:
+        """What a fired timer actually does. Returns the decision it acted on."""
+        self.handle = None
+        decision = assess_renewal(
+            renewal=self.renewal,
+            generation=generation,
+            lifecycle_ready=bool(self._lifecycle_ready()),
+            automatic_writes_allowed=bool(self._automatic()),
+            session_active=bool(self._session_active()),
+        )
+
+        if decision.action is RenewalAction.DROP:
+            self._log(f"dropping this renewal: {decision.reason}",
+                      level="WARNING")
+            return decision                       # and deliberately NO reschedule
+
+        if decision.action is RenewalAction.WAIT:
+            self._arm_timer(self.renewal.generation)
+            return decision
+
+        if decision.action is RenewalAction.RELEASE:
+            # Cancel BEFORE releasing, so nothing can re-arm behind the
+            # release. The fault is recorded so a callback that outruns the
+            # cancel still finds FAULT and drops.
+            self.renewal.state = RenewalState.FAULT
+            self.renewal.fault_reason = decision.reason
+            self.cancel("TTL expired without a confirmed renewal")
+            self._log(decision.reason, level="CRITICAL")
+            self.releases += 1
+            self._release()
+            return decision
+
+        # RENEW — through the ordinary send path, with the stored command.
+        command = self.active_command
+        verdict = self.renewal.renew(send=lambda: self._send(command),
+                                     generation=generation)
+        if verdict.is_fault:
+            self.cancel("renewal faulted")
+            self._log(verdict.detail, level="CRITICAL")
+            self.releases += 1
+            self._release()
+            return RenewalDecision(RenewalAction.RELEASE, verdict.detail)
+
+        if self.renewal.state is RenewalState.ARMED and verdict.detail.startswith("re-armed"):
+            self._arm_timer(self.renewal.generation)
+        else:
+            # Not confirmed but still inside the TTL: try again soon rather
+            # than waiting out the rest of the window.
+            self.handle = self._schedule(
+                min(self.retry_seconds,
+                    max(1.0, self.renewal.seconds_until_expiry() or 1.0)),
+                self.renewal.generation)
+        return decision

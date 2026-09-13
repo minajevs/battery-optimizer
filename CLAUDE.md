@@ -251,6 +251,21 @@ happens BEFORE any other state transition on a new slot, disable, shutdown,
 lifecycle change, release or superseding command — a timer cancelled after the
 state moved can still fire against the new state.
 
+`RenewalRunner` drives it from **one-shot timers, never a repeating one**.
+Renewal timing belongs to the last confirmed TTL, so each successful renewal
+establishes the next deadline; a periodic timer would be a second clock free to
+drift away from the TTL clock the policy was deliberately tied to. Its
+`cancel()` cancels the timer FIRST and only then invalidates the generation —
+either alone is insufficient, because AppDaemon may already have queued the
+callback (so cancelling the timer does not stop it) and a callback that outruns
+the cancel must still find a generation that no longer matches.
+
+It lives in the library rather than in `battery_optimizer.py` for a specific
+reason: "a stale callback writes nothing" has to be provable against a real
+backend, not against a decision function that merely returns DROP.
+`tests/test_renewal_runner.py` asserts `backend.sent == []` for every drop
+path, which is the claim that actually matters.
+
 **`live_test_hold_only` is a hard restriction for the first live deployment.**
 While set, anything that does not resolve to HOLD refuses loudly and sends
 nothing, so the first optimizer-owned session proves the LIFECYCLE — open, own,
