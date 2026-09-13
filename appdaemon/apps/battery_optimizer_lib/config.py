@@ -27,9 +27,16 @@ BATTERY_POWER_DIRECTIONS = ("negative_is_charging", "positive_is_charging")
 #   commissioning - supervised writes, restricted to the commissioning
 #                   allowlist. The optimizer still does NOT drive the inverter
 #                   in this mode; only deliberately invoked operations write.
+#   live          - the OPTIMIZER itself may write, unattended. The only mode
+#                   where automatic_writes_allowed is true, and the one every
+#                   other mechanism here (lease, fenced recovery, reaper,
+#                   command TTL renewal, effect verification) exists to make
+#                   safe to switch on.
 # Anything unrecognised falls back to dry_run: a typo must never be what
-# grants write access to an inverter.
-CONTROL_MODES = ("dry_run", "read_only", "commissioning")
+# grants write access to an inverter. This list and build_executor()'s are
+# deliberately SEPARATE gates -- a mode has to be named in both before it can
+# write, so neither one alone can grant authority by omission.
+CONTROL_MODES = ("dry_run", "read_only", "commissioning", "live")
 
 
 # Emitted at startup (config load) and by the DP whenever the deployed

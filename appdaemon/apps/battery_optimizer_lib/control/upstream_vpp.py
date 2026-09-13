@@ -336,6 +336,13 @@ class DryRunExecutor:
     name = "dry_run"
     can_write = False
     can_read = False
+    commissioning = False
+    #: May the OPTIMIZER drive the inverter unattended? Declared POSITIVELY by
+    #: each executor. It used to be derived as "not dry_run and not
+    #: commissioning", which made every future mode automatically live by
+    #: default -- a new executor would have been granted unattended write
+    #: authority by saying nothing at all.
+    automatic = False
 
     def __init__(self, log_func: Optional[Callable] = None):
         self._log = log_func or (lambda *a, **k: None)
@@ -429,10 +436,49 @@ class _HaRegisterReader:
             raw -= 0x100000000
         return raw / 10.0
 
+    def _write_register(self, step) -> StepResult:
+        """The ONE write implementation, shared by every executor that writes.
+
+        Commissioning and live differ in which registers they will accept and
+        in who may initiate a write — never in how a write is performed. A
+        renewal, in particular, must take the same cooldown accounting and the
+        same failure mapping as the original arm; a separate fast path for it
+        would be a second write implementation to keep correct.
+        """
+        self.writes.append(step)
+        try:
+            self.app.call_service(
+                "growatt_modbus/write_register",
+                hass_timeout=self.timeout_seconds,
+                device_id=self.device_id,
+                register=step.register,
+                value=step.value,
+            )
+        except Exception as e:  # noqa: BLE001 - the service raises on failure
+            message = str(e)
+            if "rate-limited" in message.lower() or "cooldown" in message.lower():
+                self._log(
+                    f"[{self.name}] {step.register} refused by the inverter's "
+                    f"own write cooldown: {e}",
+                    level="WARNING",
+                )
+                return StepResult.RATE_LIMITED
+            self._log(
+                f"[{self.name}] write {step.register}={step.value} failed: {e}",
+                level="ERROR",
+            )
+            return StepResult.FAILED
+
+        return StepResult.OK
+
     def _refuse(self, step: Any, reason: str) -> StepResult:
         self.refused.append(step)
-        self._log(f"[{self.name}] REFUSING {step.describe()} — {reason}",
-                  level="ERROR")
+        # describe() only exists on real steps, and the commonest reason to
+        # refuse is being handed something that is NOT one — so formatting the
+        # refusal must not itself raise.
+        describe = getattr(step, "describe", None)
+        what = describe() if callable(describe) else repr(step)[:80]
+        self._log(f"[{self.name}] REFUSING {what} — {reason}", level="ERROR")
         return StepResult.FAILED
 
     def _extract_values(self, result: Any, count: int) -> Optional[List[int]]:
@@ -519,6 +565,7 @@ class HaReadOnlyExecutor(_HaRegisterReader):
     can_write = False
     can_read = True
     commissioning = False
+    automatic = False
 
     def execute(self, step: Any) -> StepResult:
         """Refuse. This executor exists precisely so writes cannot happen."""
@@ -544,6 +591,9 @@ class HaCommissioningExecutor(_HaRegisterReader):
     can_write = True
     can_read = True
     commissioning = True
+    #: Can write, but only when a person invokes an operation. The optimizer
+    #: plans every slot and transmits none of it.
+    automatic = False
 
     # Exactly what the supervised operations need, and nothing else.
     # Notably absent: 30410 (AC charge), 30404/30405 (SOC cutoffs) and 30411
@@ -573,31 +623,66 @@ class HaCommissioningExecutor(_HaRegisterReader):
                 f"allowlist {sorted(self.WRITABLE_REGISTERS)}",
             )
 
-        self.writes.append(step)
-        try:
-            self.app.call_service(
-                "growatt_modbus/write_register",
-                hass_timeout=self.timeout_seconds,
-                device_id=self.device_id,
-                register=step.register,
-                value=step.value,
-            )
-        except Exception as e:  # noqa: BLE001 - the service raises on failure
-            message = str(e)
-            if "rate-limited" in message.lower() or "cooldown" in message.lower():
-                self._log(
-                    f"[{self.name}] {step.register} refused by the inverter's "
-                    f"own write cooldown: {e}",
-                    level="WARNING",
-                )
-                return StepResult.RATE_LIMITED
-            self._log(
-                f"[{self.name}] write {step.register}={step.value} failed: {e}",
-                level="ERROR",
-            )
-            return StepResult.FAILED
+        return self._write_register(step)
 
-        return StepResult.OK
+
+class HaLiveExecutor(_HaRegisterReader):
+    """Real writes, chosen by the OPTIMIZER, unattended.
+
+    The only executor that answers ``automatic = True``. Everything the rest of
+    this package does — the lease written before authority is taken, the fenced
+    recovery, the reaper, the renewal TTL, the effect verification that latches
+    degraded — exists so that this one can be turned on without the inverter
+    being left in a state nobody owns.
+
+    It deliberately shares the commissioning executor's write plumbing and
+    differs in exactly two things: the register surface (a normal ``build_plan``
+    needs AC charge mode, the SOC cutoffs and the export policy, which
+    commissioning refuses) and who is allowed to initiate a write. Sharing the
+    plumbing matters — a renewal must take the same lock, the same read-back
+    verification and the same cooldown accounting as the original arm, because
+    a separate "fast path" for renewals would be a second write implementation
+    to keep correct.
+
+    What it still cannot do is bypass the backend's interlocks: 30411 > 0,
+    inherited authority, a half-armed pair and a fenced lease all refuse here
+    exactly as they do everywhere else. This grants the optimizer permission to
+    ask, never permission to override.
+    """
+
+    name = "ha_live"
+    can_write = True
+    can_read = True
+    commissioning = False
+    automatic = True
+
+    #: 30411 is NEVER written — the inverter's own TOU schedule is not ours,
+    #: and no plan in this project touches it. Everything else a normal plan
+    #: needs is here.
+    WRITABLE_REGISTERS = frozenset({
+        REG_CONTROL_AUTHORITY,   # 30100
+        REG_EXPORT_LIMIT_ENABLE, # 30200
+        REG_EXPORT_LIMIT_RATE,   # 30201
+        REG_CHARGE_CUTOFF_SOC,   # 30404
+        REG_DISCHARGE_CUTOFF_SOC,# 30405
+        REG_REMOTE_ENABLE,       # 30407
+        REG_REMOTE_DURATION,     # 30408 — the command TTL
+        REG_REMOTE_POWER,        # 30409
+        REG_AC_CHARGE_ENABLE,    # 30410
+        REG_PRIORITY_MODE,       # 30476
+    })
+
+    def execute(self, step: Any) -> StepResult:
+        if not isinstance(step, RegisterWrite):
+            return self._refuse(step, "only register writes are permitted")
+        if step.register not in self.WRITABLE_REGISTERS:
+            return self._refuse(
+                step,
+                f"register {step.register} is not in the live allowlist "
+                f"{sorted(self.WRITABLE_REGISTERS)}. 30411 in particular is "
+                f"never written: the inverter's TOU schedule is not ours")
+
+        return self._write_register(step)
 
 
 def build_executor(app, config):
@@ -614,6 +699,11 @@ def build_executor(app, config):
         log_func=log,
     )
 
+    # Explicit, one mode at a time. "Anything that is not commissioning" must
+    # never come to mean live: an unrecognised mode is a misconfiguration, and
+    # a misconfiguration must not be what grants an inverter's write authority.
+    if mode == "live":
+        return HaLiveExecutor(app, **kwargs)
     if mode == "commissioning":
         return HaCommissioningExecutor(app, **kwargs)
     if mode == "read_only":
@@ -751,8 +841,14 @@ class UpstreamVppBackend:
         exactly why this is a separate question. Answering "can this process
         write?" would let the scheduler start trading the moment commissioning
         was enabled.
+
+        Asked of the executor POSITIVELY, and defaulting to False. The old
+        definition was ``not dry_run and not commissioning``, so any executor
+        that was neither became automatically live — a new mode would have
+        inherited unattended write authority by omission.
         """
-        return not self.dry_run and not self.commissioning
+        return (bool(getattr(self.executor, "automatic", False))
+                and not self.dry_run)
 
     @property
     def control_status(self) -> str:

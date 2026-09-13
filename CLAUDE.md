@@ -161,9 +161,21 @@ merely disabled: `DryRunExecutor` performs no I/O, `HaReadOnlyExecutor` performs
 real `get_register_data` reads and **refuses** every write step, and
 `HaCommissioningExecutor` writes only to a fixed register allowlist
 (30100/30407/30408/30409/30476) and refuses everything else *at the executor*,
-rather than trusting whichever plan it is handed. `control_mode` in apps.yaml
-picks one, and an unrecognised value falls back to `dry_run` — a typo must never
-be what grants write access to an inverter.
+rather than trusting whichever plan it is handed. `HaLiveExecutor` is the ONLY
+one the optimizer may drive unattended; it shares the same write implementation
+(`_write_register`, so a renewal takes the same cooldown accounting and failure
+mapping as the original arm) and differs in its register surface and in who may
+initiate a write. 30411 is outside every allowlist, live included.
+
+**Permission is declared POSITIVELY and gated TWICE.** Each executor sets
+`automatic`, and `automatic_writes_allowed` reads it; it used to be derived as
+`not dry_run and not commissioning`, which would have made any future executor
+live by saying nothing at all. And a mode must be named in BOTH
+`config.CONTROL_MODES` and `build_executor()` before it can write — adding
+`live` to one and not the other leaves it coerced to `dry_run`, which is the
+fail-safe working. `control_mode` in apps.yaml picks one, and an unrecognised
+value falls back to `dry_run` — a typo must never be what grants write access
+to an inverter.
 
 **`commissioning` mode is not "live" mode.** It can write, so
 `backend.dry_run` is False for it — which is exactly why
