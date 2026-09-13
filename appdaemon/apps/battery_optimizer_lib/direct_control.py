@@ -22,6 +22,7 @@ import enum
 from typing import Optional
 
 from .control import (
+    DEFAULT_COMMAND_TTL_MINUTES,
     ControlAction,
     EffectVerdict,
     InverterCommand,
@@ -173,12 +174,27 @@ class DirectControl:
         return self.config.device_id
 
     def _duration_for_slot(self) -> int:
-        """Override duration: slot_minutes + safety buffer.
+        """The command's TTL — NOT the slot length.
 
-        If the optimizer misses a refresh, the override expires and the
-        inverter reverts to its panel-configured base mode.
+        This used to return ``slot_minutes + buffer``, on the reasoning that
+        "if the optimizer misses a refresh, the override expires and the
+        inverter reverts to its panel-configured base mode". Hardware says
+        otherwise. Matched runs on 2026-09-08 (31200/31201 sampled at 5 s)
+        showed 30408 bounding the ENERGETIC COMMAND to within one sample —
+        1 min collapsed at 60 s, 2 min at 122 s — while leaving 30100=1,
+        30407=1 and the setpoint exactly where they were. Expiry does not
+        revert anything: it stops the battery doing what was asked and leaves
+        local logic suppressed, so the house moves onto the grid.
+
+        So expiry is the hazard, not the fallback, and a slot longer than the
+        TTL is covered by RE-ARMING (``control/renewal.py``) rather than by
+        asking for a duration long enough to span it. 30408 is validated
+        1..10 minutes on this firmware, and a 15 minute slot could not be
+        spanned anyway.
         """
-        return self.config.slot_minutes + self.config.direct_control_buffer_minutes
+        ttl = int(getattr(self.config, "command_ttl_minutes",
+                          DEFAULT_COMMAND_TTL_MINUTES))
+        return max(1, min(10, ttl))
 
     # --- command construction --------------------------------------------
 

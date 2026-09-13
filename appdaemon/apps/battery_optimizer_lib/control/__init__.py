@@ -19,6 +19,11 @@ from .commissioning import (
 )
 from .heartbeat import Heartbeat
 from .lease import LeaseRecord, SessionLease
+from .renewal import (
+    CommandRenewal,
+    DEFAULT_COMMAND_TTL_MINUTES,
+    RenewalState,
+)
 from .startup import (
     OptimizerLifecycle,
     StartupRecovery,
@@ -61,7 +66,10 @@ __all__ = [
     "DEFAULT_WATCHDOG_MINUTES",
     "DEFAULT_WATCHDOG_OBSERVE_SECONDS",
     "DryRunExecutor",
+    "CommandRenewal",
+    "DEFAULT_COMMAND_TTL_MINUTES",
     "Heartbeat",
+    "RenewalState",
     "OptimizerLifecycle",
     "StartupRecovery",
     "recover_previous_session",

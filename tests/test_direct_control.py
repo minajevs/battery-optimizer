@@ -204,17 +204,31 @@ def test_failure_result_returns_false_and_does_not_record():
     assert "ERROR" in app.levels()
 
 
-def test_command_carries_resolved_action_and_watchdog_duration():
-    """The command handed to the backend is fully resolved policy."""
+def test_command_carries_resolved_action_and_the_command_ttl():
+    """The command handed to the backend is fully resolved policy.
+
+    The duration is the COMMAND's TTL, not the slot length. It used to be
+    slot_minutes + buffer, on the reasoning that a missed refresh would let
+    the override expire and the inverter revert to its base mode. Matched
+    hardware runs on 2026-09-08 disproved that: 30408 bounds the energetic
+    command (1 min -> 60 s, 2 min -> 122 s) and leaves 30100/30407/30409
+    exactly as they were, so expiry suppresses local logic and puts the house
+    on the grid. A slot longer than the TTL is covered by RE-ARMING.
+    """
+    from battery_optimizer_lib.control import DEFAULT_COMMAND_TTL_MINUTES
+
     dc, app, backend = make_dc()
 
     dc.apply_mode(charge_entry())
 
     command = backend.sent[0]
     assert command.action is ControlAction.GRID_CHARGE
-    assert command.duration_minutes == (
-        dc.config.slot_minutes + dc.config.direct_control_buffer_minutes
-    )
+    assert command.duration_minutes == DEFAULT_COMMAND_TTL_MINUTES
+    assert 1 <= command.duration_minutes <= 10, (
+        "30408 is validated 1..10 minutes on this firmware")
+    assert command.duration_minutes < dc.config.slot_minutes, (
+        "the TTL is expected to be shorter than a slot — that is why renewal "
+        "exists; if this ever flips, renewal stops being exercised")
     assert command.power_percent == dc.config.default_power_percent
     # A CHARGE slot carries the charge cutoff, never the discharge one.
     assert command.charge_cutoff_soc == int(dc.config.default_max_soc)

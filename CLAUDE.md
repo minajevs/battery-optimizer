@@ -225,6 +225,24 @@ reads armed — which is exactly why EFFECT verification cannot be replaced by
 register read-back. And **every session must still be watched to its release**:
 the duration bounds the command, never the ownership.
 
+**A slot longer than the command TTL must RE-ARM (`control/renewal.py`).**
+`_duration_for_slot()` used to return `slot_minutes + buffer`, documented as
+"if the optimizer misses a refresh, the override expires and the inverter
+reverts to its panel-configured base mode". The matched runs disproved that
+premise: expiry stops the battery and reverts NOTHING, so a long duration is
+not a safety net and expiry is the hazard. The duration is now the TTL itself
+(`command_ttl_minutes`, 1-10 as 30408 validates), and `CommandRenewal` re-arms
+at `command_renew_fraction` (0.5) of it.
+
+Two rules the policy encodes. The renewal clock is **the TTL's**, never the
+poll interval's — "renew every 60 s because `scan_interval` is 60 s" ties a
+hardware deadline to an unrelated setting, and the margin then changes silently
+when either moves. And **an unconfirmed renewal is a control fault**: inside the
+TTL it retries (that is what the 50 % fraction buys), but once the TTL has run
+out the command's effect has stopped while the session is still armed, so the
+only honest response is to release rather than keep commanding something the
+inverter is no longer doing.
+
 **That is what `control/lease.py` exists for.** A durable JSON lease is written
 BEFORE authority is taken and removed only once both halves of a release are
 confirmed, so a process that dies mid-session leaves evidence. A later run that

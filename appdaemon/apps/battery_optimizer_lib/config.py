@@ -156,6 +156,18 @@ class BatteryOptimizerConfig:
     # question about the same file, and a startup that is more eager than the
     # reaper would release sessions the reaper still considers owned.
     heartbeat_stale_seconds: float = 90.0
+    # How long a single armed command is good for — 30408, in minutes, which
+    # this firmware validates as 1..10. This is the ENERGETIC TTL: matched runs
+    # on 2026-09-08 showed the battery effect collapsing at 60 s for 1 min and
+    # 122 s for 2 min, with 30100/30407/30409 unchanged. A slot longer than
+    # this is covered by re-arming (control/renewal.py), never by asking for a
+    # longer duration, and expiry is a hazard rather than a fallback: the
+    # command stops while the session stays armed and the house draws grid.
+    command_ttl_minutes: int = 5
+    # Re-arm this far through the TTL. 0.5 leaves the whole second half for
+    # retries, so a renewal that misses once can still land before the effect
+    # stops.
+    command_renew_fraction: float = 0.5
     # "auto" = use register 30476 only if a supervised probe confirmed it is
     # genuinely writable; "never" = never write it.
     priority_mode_write: str = "auto"
@@ -523,6 +535,9 @@ class BatteryOptimizerConfig:
             heartbeat_seconds=int(args.get("heartbeat_seconds", 30)),
             heartbeat_stale_seconds=float(
                 args.get("heartbeat_stale_seconds", 90)),
+            command_ttl_minutes=int(args.get("command_ttl_minutes", 5)),
+            command_renew_fraction=float(
+                args.get("command_renew_fraction", 0.5)),
             priority_mode_write=args.get("priority_mode_write", "auto"),
             control_mode=args.get("control_mode", "dry_run"),
             use_inverter_energy_sensors=args.get("use_inverter_energy_sensors", True),
