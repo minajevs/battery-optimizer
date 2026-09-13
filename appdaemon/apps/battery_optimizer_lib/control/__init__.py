@@ -21,6 +21,9 @@ from .heartbeat import Heartbeat
 from .lease import LeaseRecord, SessionLease
 from .renewal import (
     CommandRenewal,
+    RenewalAction,
+    RenewalDecision,
+    assess_renewal,
     DEFAULT_COMMAND_TTL_MINUTES,
     RenewalState,
 )
@@ -67,6 +70,9 @@ __all__ = [
     "DEFAULT_WATCHDOG_OBSERVE_SECONDS",
     "DryRunExecutor",
     "CommandRenewal",
+    "RenewalAction",
+    "RenewalDecision",
+    "assess_renewal",
     "DEFAULT_COMMAND_TTL_MINUTES",
     "Heartbeat",
     "RenewalState",

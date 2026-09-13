@@ -267,6 +267,31 @@ class DirectControl:
 
         command = self.build_command(entry)
 
+        # Supervised first-live-run gate. Deliberately a HARD RESTRICTION and
+        # not a preference: the first deployment that can write unattended must
+        # not be able to turn whatever the optimizer currently considers
+        # optimal into grid charge or MAX_EXPORT. With this set, anything that
+        # does not resolve to HOLD refuses and says so loudly, so the first
+        # optimizer-owned session proves the LIFECYCLE — open, own, renew,
+        # release — rather than a power decision.
+        #
+        # Remove it (config: live_test_hold_only) only once that lifecycle has
+        # been proved on hardware.
+        if (self.config.live_test_hold_only
+                and command.action is not ControlAction.HOLD):
+            self.app.log(
+                f"DirectControl: REFUSING {command.action.value} — "
+                f"live_test_hold_only is set, so this supervised deployment "
+                f"may only transmit HOLD. The schedule wanted "
+                f"{entry.mode.name}; nothing was sent. Clear the flag when the "
+                f"session lifecycle has been proved on hardware.",
+                level="ERROR",
+            )
+            # DRY_RUN because nothing was attempted: health accounting treats
+            # it as neutral, which is right — a refusal is not an inverter
+            # failure and must not count toward the degraded streak.
+            return self._record_outcome(ApplyOutcome.DRY_RUN)
+
         if self._is_duplicate(command):
             self.app.log(
                 f"DirectControl: skipping duplicate {command.action.value} "

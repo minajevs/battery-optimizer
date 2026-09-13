@@ -237,6 +237,29 @@ reads armed — which is exactly why EFFECT verification cannot be replaced by
 register read-back. And **every session must still be watched to its release**:
 the duration bounds the command, never the ownership.
 
+**Every renewal callback carries a GENERATION, and every guard is a reason to
+DROP.** A renewal timer fires minutes after it was scheduled, and in between
+the slot may have changed, the app may have been disabled, the lifecycle may
+have left `READY`, the mode may have been reduced, or the session may have been
+released — by a person, by the reaper, or by this app's own fault handling.
+`assess_renewal()` checks all of it and returns DROP / WAIT / RENEW / RELEASE;
+a callback that "tries to be helpful" in any of those cases re-arms an inverter
+nobody expects to be armed. **Stale-timer resurrection is the failure mode
+here**, which is why `record_armed()` returns a generation, `cancel()` bumps it,
+and a callback carrying an old one is dropped without writing. Cancellation
+happens BEFORE any other state transition on a new slot, disable, shutdown,
+lifecycle change, release or superseding command — a timer cancelled after the
+state moved can still fire against the new state.
+
+**`live_test_hold_only` is a hard restriction for the first live deployment.**
+While set, anything that does not resolve to HOLD refuses loudly and sends
+nothing, so the first optimizer-owned session proves the LIFECYCLE — open, own,
+renew, release — rather than a power decision. Without it, flipping
+`control_mode: live` would let whatever the optimizer currently considers
+optimal become the first automatic write this system has ever made, and that
+could be grid charge or MAX_EXPORT. Off by default; clear it only once the
+lifecycle is proved on hardware.
+
 **A slot longer than the command TTL must RE-ARM (`control/renewal.py`).**
 `_duration_for_slot()` used to return `slot_minutes + buffer`, documented as
 "if the optimizer misses a refresh, the override expires and the inverter

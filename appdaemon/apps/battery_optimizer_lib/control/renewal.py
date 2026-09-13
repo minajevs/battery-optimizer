@@ -94,6 +94,13 @@ class CommandRenewal:
         self.renewals = 0
         self.failures = 0
         self.fault_reason: Optional[str] = None
+        # Every armed command gets a GENERATION, and every scheduled renewal
+        # callback carries the one it was scheduled for. A timer cannot be
+        # un-scheduled reliably across a slot change, a release or a restart,
+        # so the callback must be able to recognise that the world moved on.
+        # Stale-timer resurrection -- an old callback re-arming a command that
+        # was already released -- is the failure mode this exists to prevent.
+        self.generation = 0
 
     # --- clock ------------------------------------------------------------
 
@@ -109,17 +116,42 @@ class CommandRenewal:
 
     # --- lifecycle --------------------------------------------------------
 
-    def record_armed(self, at: Optional[float] = None) -> None:
-        """A command was confirmed armed; its TTL starts now."""
+    def record_armed(self, at: Optional[float] = None) -> int:
+        """A command was confirmed armed; its TTL starts now.
+
+        Returns the generation this arming belongs to. Whoever schedules the
+        renewal callback must carry that value and hand it back, so a callback
+        belonging to a superseded command can be recognised and dropped.
+        """
         self.armed_at = self._now() if at is None else at
         self.state = RenewalState.ARMED
         self.fault_reason = None
+        self.generation += 1
+        return self.generation
+
+    def cancel(self, reason: str = "") -> int:
+        """Invalidate any renewal in flight or scheduled. Returns the new generation.
+
+        Called BEFORE any other state transition on a new slot, a disable, a
+        shutdown, a lifecycle change, a release or a superseding command. The
+        ordering matters more than the bookkeeping: a timer cancelled after the
+        state has already moved can still fire against the new state.
+        """
+        self.generation += 1
+        self.state = RenewalState.IDLE
+        self.armed_at = None
+        self.fault_reason = None
+        if reason:
+            self._log(f"renewal cancelled: {reason} "
+                      f"(generation now {self.generation})")
+        return self.generation
 
     def released(self) -> None:
         """The session was released; there is nothing left to renew."""
         self.state = RenewalState.IDLE
         self.armed_at = None
         self.fault_reason = None
+        self.generation += 1
 
     # --- questions --------------------------------------------------------
 
@@ -146,13 +178,21 @@ class CommandRenewal:
 
     # --- acting -----------------------------------------------------------
 
-    def renew(self, send) -> RenewalVerdict:
+    def renew(self, send, generation: Optional[int] = None) -> RenewalVerdict:
         """Re-arm via ``send()``, which must return True only on a CONFIRMED arm.
 
         ``send`` is the caller's re-arm — the same command, through the same
         backend, so it goes through the same lock and the same read-back
         verification as the original. Renewal is not a special write path.
         """
+        if generation is not None and generation != self.generation:
+            return RenewalVerdict(
+                self.state,
+                f"ignoring a renewal for generation {generation}: the current "
+                f"command is generation {self.generation}. This callback "
+                f"belongs to a command that has already been superseded or "
+                f"released")
+
         if self.state is RenewalState.RENEWING:
             return RenewalVerdict(
                 self.state, "a renewal is already in flight; not starting a "
@@ -215,4 +255,109 @@ class CommandRenewal:
             "renewals": self.renewals,
             "failures": self.failures,
             "fault_reason": self.fault_reason,
+            "generation": self.generation,
         }
+
+
+class RenewalAction(enum.Enum):
+    """What a renewal callback should do, having checked the whole world."""
+
+    #: Do nothing, and stop rescheduling. The command this callback belongs to
+    #: is gone, or this process is no longer allowed to drive the inverter.
+    DROP = "drop"
+    #: Not yet due. Nothing to do, keep watching.
+    WAIT = "wait"
+    #: Re-arm now, through the ordinary send path.
+    RENEW = "renew"
+    #: The command's TTL has run out without a confirmed renewal. Release.
+    RELEASE = "release"
+
+
+@dataclass(frozen=True)
+class RenewalDecision:
+    action: RenewalAction
+    reason: str
+
+    @property
+    def writes(self) -> bool:
+        """Will acting on this decision touch the inverter?"""
+        return self.action in (RenewalAction.RENEW, RenewalAction.RELEASE)
+
+
+def assess_renewal(
+    *,
+    renewal: "CommandRenewal",
+    generation: Optional[int],
+    lifecycle_ready: bool,
+    automatic_writes_allowed: bool,
+    session_active: bool,
+    scheduled_command=None,
+    active_command=None,
+) -> RenewalDecision:
+    """Decide what a fired renewal timer may do. Writes nothing itself.
+
+    Every condition is a reason to DROP, never a reason to try harder. A
+    renewal callback runs minutes after it was scheduled, and in between the
+    slot may have changed, the app may have been disabled, the lifecycle may
+    have left READY, the mode may have been reduced, or the session may have
+    been released — by a person, by the reaper, or by this app's own fault
+    handling. A callback that "tries to be helpful" in any of those cases
+    re-arms an inverter nobody is expecting to be armed.
+
+    The generation check is the load-bearing one, because it is the only one
+    that catches a superseded command whose replacement looks identical.
+    """
+    if generation is not None and generation != renewal.generation:
+        return RenewalDecision(
+            RenewalAction.DROP,
+            f"stale callback: scheduled for generation {generation}, current "
+            f"is {renewal.generation}")
+
+    if renewal.state is RenewalState.FAULT:
+        return RenewalDecision(
+            RenewalAction.DROP,
+            f"the renewal already faulted ({renewal.fault_reason}); the "
+            f"session is being released and must not be re-armed")
+
+    if renewal.state is RenewalState.IDLE:
+        return RenewalDecision(RenewalAction.DROP,
+                               "nothing is armed; there is no command to renew")
+
+    if not lifecycle_ready:
+        return RenewalDecision(
+            RenewalAction.DROP,
+            "the optimizer is no longer READY, so it may not command the "
+            "inverter — startup recovery or a fault owns it now")
+
+    if not automatic_writes_allowed:
+        return RenewalDecision(
+            RenewalAction.DROP,
+            "automatic writes are not allowed in this mode; a renewal is a "
+            "write like any other")
+
+    if not session_active:
+        return RenewalDecision(
+            RenewalAction.DROP,
+            "the session is no longer active — released, reaped or taken over "
+            "— so there is nothing of ours to renew")
+
+    if (scheduled_command is not None and active_command is not None
+            and scheduled_command != active_command):
+        return RenewalDecision(
+            RenewalAction.DROP,
+            "the active command changed since this renewal was scheduled; the "
+            "new one has a renewal of its own")
+
+    if renewal.expired():
+        return RenewalDecision(
+            RenewalAction.RELEASE,
+            "the command TTL ran out without a confirmed renewal: the battery "
+            "has stopped doing what was asked while the session is still "
+            "armed. Release rather than command something the inverter is no "
+            "longer doing")
+
+    if renewal.due():
+        return RenewalDecision(RenewalAction.RENEW,
+                               "the command is past its renewal point")
+
+    return RenewalDecision(RenewalAction.WAIT, "not yet due")

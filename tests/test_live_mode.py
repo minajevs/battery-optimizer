@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 from battery_optimizer_lib.config import BatteryOptimizerConfig
-from battery_optimizer_lib.control import UpstreamVppBackend, build_executor
+from battery_optimizer_lib.control import (
+    ControlAction, UpstreamVppBackend, build_executor)
 from battery_optimizer_lib.control.upstream_vpp import (
     DryRunExecutor,
     HaCommissioningExecutor,
@@ -159,3 +160,47 @@ def test_a_mode_missing_from_the_config_gate_cannot_write_however_it_is_spelled(
     config = BatteryOptimizerConfig(device_id="dev", control_mode="live")
     config.control_mode = "not_a_mode"          # as a typo would leave it
     assert isinstance(build_executor(app, config), DryRunExecutor)
+
+
+# ---------------------------------------------------------------------------
+# The supervised first-live-run gate
+# ---------------------------------------------------------------------------
+
+def test_hold_only_refuses_every_action_that_is_not_hold():
+    """A HARD restriction, not a preference. The first deployment that can
+    write unattended must not be able to turn the current optimization result
+    into grid charge or MAX_EXPORT."""
+    from battery_optimizer_lib.models import BatteryMode, ScheduleEntry
+    from test_direct_control import make_dc
+    import datetime
+
+    dc, app, backend = make_dc(control_mode="live", live_test_hold_only=True)
+
+    for mode in (BatteryMode.CHARGE, BatteryMode.DISCHARGE):
+        backend.sent.clear()
+        entry = ScheduleEntry(time=datetime.datetime(2026, 9, 13, 12, 0),
+                              mode=mode, reason="test")
+        dc.apply_mode(entry)
+        assert backend.sent == [], f"{mode.name} must not reach the inverter"
+
+    assert any("live_test_hold_only" in m and lvl == "ERROR"
+               for m, lvl in app.logs)
+
+
+def test_hold_itself_still_goes_through_under_the_gate():
+    from battery_optimizer_lib.models import BatteryMode, ScheduleEntry
+    from test_direct_control import make_dc
+    import datetime
+
+    dc, _app, backend = make_dc(control_mode="live", live_test_hold_only=True)
+    entry = ScheduleEntry(time=datetime.datetime(2026, 9, 13, 12, 0),
+                          mode=BatteryMode.HOLD, reason="test")
+
+    dc.apply_mode(entry)
+
+    assert len(backend.sent) == 1
+    assert backend.sent[0].action is ControlAction.HOLD
+
+
+def test_the_gate_is_off_by_default_so_it_cannot_silently_throttle_production():
+    assert BatteryOptimizerConfig(device_id="d").live_test_hold_only is False

@@ -170,6 +170,12 @@ class BatteryOptimizerConfig:
     # this is covered by re-arming (control/renewal.py), never by asking for a
     # longer duration, and expiry is a hazard rather than a fallback: the
     # command stops while the session stays armed and the house draws grid.
+    # Supervised first-live-run restriction. While true, the optimizer may
+    # transmit ONLY HOLD; anything else refuses loudly and sends nothing. The
+    # first deployment able to write unattended must not be able to turn the
+    # current optimization result into grid charge or MAX_EXPORT — Stage 7A
+    # proves the session lifecycle, not a power decision.
+    live_test_hold_only: bool = False
     command_ttl_minutes: int = 5
     # Re-arm this far through the TTL. 0.5 leaves the whole second half for
     # retries, so a renewal that misses once can still land before the effect
@@ -542,6 +548,8 @@ class BatteryOptimizerConfig:
             heartbeat_seconds=int(args.get("heartbeat_seconds", 30)),
             heartbeat_stale_seconds=float(
                 args.get("heartbeat_stale_seconds", 90)),
+            live_test_hold_only=bool(
+                args.get("live_test_hold_only", False)),
             command_ttl_minutes=int(args.get("command_ttl_minutes", 5)),
             command_renew_fraction=float(
                 args.get("command_renew_fraction", 0.5)),
