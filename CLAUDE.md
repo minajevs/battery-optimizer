@@ -408,9 +408,12 @@ runs the same library code over the REST shim, which is how that was done
 without deploying to AppDaemon.
 
 **Its independence has a boundary.** It is independent of the optimizer *app*,
-not of AppDaemon. If the add-on dies, both die and the inverter stays armed
-until AppDaemon returns. A watcher outside AppDaemon is the remaining piece,
-and is a prerequisite for unattended energetic control.
+not of AppDaemon. If the add-on dies, both die. That gap is covered by the HA
+watchdog package (`homeassistant/packages/battery_optimizer_watchdog.yaml`,
+proven 2026-09-13): it watches `sensor.battery_optimizer_liveness` and
+`sensor.battery_session_reaper`, restarts the add-on when both are quiet for
+300 s + 120 s, and leaves every inverter decision to startup recovery. Details
+in `docs/deployment.md` §7.
 
 **Cleanup after `session_test` obeys three rules.** It always runs (a
 `finally`, so a failure, an exception or a Ctrl-C all leave through it); it is
@@ -701,14 +704,28 @@ timeout plus more threads, not a rewrite.
 
 ## Deployment to the HA machine
 
-The running app lives on the Home Assistant share, not in this repo:
+**Read `docs/deployment.md` before touching the live system.** It is the
+runbook: topology and ids, credentials and what they can reach, mounting the
+shares, what is in the live `apps.yaml`/`appdaemon.yaml`, exact deploy and
+verify commands, the monitoring/watchdog setup, and the gotchas that each cost
+a deployment cycle. The essentials, which are easy to get wrong:
 
-```
-//192.168.33.167/addon_configs/a0d7b954_appdaemon/apps/
-├── apps.yaml              # LIVE config, contains the HA token — never overwrite from here
-├── battery_optimizer.py
-└── battery_optimizer_lib/
-```
+- Home Assistant is `http://192.168.1.130:8123`. **Not** `192.168.33.167` —
+  that was the upstream fork's host and does not exist here. `deploy.ps1` is the
+  upstream fork's Windows script for that host; use `scripts/deploy.py`.
+- The inverter `device_id` is the PARENT device `c309d26919de729fc20af4734070a56f`.
+  `device_id()` on a child entity returns a different, wrong id.
+- Never open a TCP connection to the Modbus gateway `192.168.2.127:502`; all
+  inverter I/O goes through the `growatt_modbus` services. The integration's
+  `scan_interval` must stay 60 s (hardware constraint).
+- Secrets live in `~/.ha_token` and `~/.ha_samba_password`. Pass them with
+  `$(cat …)`; never print them. The live
+  `addon_configs/a0d7b954_appdaemon/apps/apps.yaml` contains the HA token —
+  never overwrite it from the repo, never commit it, redact it when displaying.
+- Shares mount at `~/mnt/ha-config` (HA `/config`) and `~/mnt/ha-addons`
+  (AppDaemon's `/config` is `a0d7b954_appdaemon/`). They drop; remount per the
+  runbook. `deploy.py` needs `--addons-mount ~/mnt/ha-addons --config-mount
+  ~/mnt/ha-config` because its defaults point at `/Volumes`.
 
 **STOP the AppDaemon add-on before copying more than one file.** AppDaemon
 hot-reloads on every `.py` modification, so a multi-file copy is imported
@@ -720,37 +737,27 @@ ModuleNotFoundError: No module named 'battery_optimizer_lib.soc_projection'
 TypeError: record_discharging() got an unexpected keyword argument 'battery_temp_start'
 ```
 
-from a tree whose files were all individually correct. Copying a *single*
-file while running is safe (one reload, no window).
+from a tree whose files were all individually correct. The long-lived token
+cannot stop or start add-ons (401), so ask the user to do it in the UI, and
+pass `deploy.py --appdaemon-stopped` only once they confirm — it is an
+assertion, not a formality. `deploy.py` runs the checks, backs up to
+`deploy-backups/` on the share, copies, and SHA256-verifies every file; it
+never copies `apps.yaml`. Always `--dry-run` first, and smoke-test config with
+`scripts/smoke_config.py <apps.yaml>` — the unit suite does not cover the
+orchestrator, so a config or wiring break only shows up there or on hardware.
 
-Procedure:
-
-1. Back up `battery_optimizer.py` + `battery_optimizer_lib/` on the share.
-2. Stop the add-on.
-3. Copy both, then delete `__pycache__` in each directory.
-4. Verify every deployed file matches the repo, then start the add-on.
-
-Before deploying, smoke-test the new code against the LIVE `apps.yaml`
-(`BatteryOptimizerConfig.from_args`) and import every module — the unit suite
-does not cover the orchestrator, so a config or wiring break only shows up here.
-
-`scripts/deploy.ps1` automates exactly that procedure (Windows PowerShell 5.1):
-git-clean check plus the commit/branch it will deploy, `pytest`, `py_compile`,
-`scripts/smoke_config.py` against a temp copy of the LIVE `apps.yaml` (deleted
-immediately — the share's `apps.yaml` is only ever read), a timestamped
-`backup-<ts>/` on the share keeping the 5 newest, stop → copy (pruning `.py`
-files the repo no longer has) → `__pycache__` cleanup → SHA256 verification →
-start. Start with `-DryRun`, which runs every check and prints the planned copy
-list while writing nothing; `-Restore <backup-dir>` rolls a deploy back through
-the same stop/copy/start dance. Add-on stop/start goes through HA's Supervisor
-proxy when `-HaToken` is given, otherwise the script pauses for you to do it in
-the UI. See `scripts/README.md`.
+As of 2026-09-15 the deployed code is commit `0a0cfef` in `control_mode:
+read_only`, with `session_reaper` and the HA watchdog package live, and there
+is **no working enable switch**: `_is_enabled()` defaults to `True` and
+`input_boolean.battery_optimizer_enabled` does not exist because
+`homeassistant/packages/battery_optimizer.yaml` is not installed. That must be
+fixed before any write-capable mode. See `docs/deployment.md` §0.
 
 ## Development
 
 This is a Python AppDaemon project. Use `uv` for running Python scripts and syntax checks. No formatter or linter is enforced.
 
-**Shell note**: Even though the platform is Windows, the shell is bash. Don't use Windows-specific syntax like `cd /d`. The working directory is already set, so run commands directly without `cd`.
+**Shell note**: development happens on macOS (zsh/bash). The repo venv is Python 3.10 while Home Assistant and AppDaemon run 3.13-3.14, so avoid syntax newer than 3.10 in library code. In this environment `uv run --no-project python …` is what the deploy and test commands in `docs/deployment.md` use.
 
 ```bash
 # Check syntax

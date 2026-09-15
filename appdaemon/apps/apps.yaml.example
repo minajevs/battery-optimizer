@@ -1,5 +1,11 @@
 # AppDaemon Apps Configuration
 # Battery Optimizer - Nord Pool price-based charge/discharge scheduling
+#
+# TEMPLATE. The real file lives on the Home Assistant share at
+# addon_configs/a0d7b954_appdaemon/apps/apps.yaml, holds the HA token, and is
+# never deployed or committed from this repo. For the reference installation's
+# actual values (device id, Nord Pool entry, sensors, mode) and how to edit it
+# safely, see docs/deployment.md.
 
 battery_optimizer:
   module: battery_optimizer
@@ -148,9 +154,31 @@ battery_optimizer:
   #                   person runs scripts/commission.py, one operation at a
   #                   time. Grid charge, both discharges and max export are
   #                   refused outright in this mode.
-  # Unattended live control is a separate, later opt-in. Anything unrecognised
-  # falls back to dry_run: a typo must never be what grants write access.
+  #   live          - the OPTIMIZER itself writes, unattended. Only enable it
+  #                   after the enable switch (input_boolean from
+  #                   homeassistant/packages/battery_optimizer.yaml) is
+  #                   installed and proven, the reaper and the HA watchdog are
+  #                   running, and the supervised sequence in CLAUDE.md has
+  #                   passed. Start with live_test_hold_only: true.
+  # Anything unrecognised falls back to dry_run: a typo must never be what
+  # grants write access. A mode must be named in BOTH config.CONTROL_MODES and
+  # build_executor() before it can write.
   control_mode: "dry_run"
+
+  # Supervised first-live-run restriction. While true, only HOLD is ever
+  # transmitted; anything else refuses loudly and sends nothing. Keep it on for
+  # the first live deployment so it proves the session lifecycle (open, own,
+  # renew, release) rather than a power decision.
+  live_test_hold_only: false
+
+  # 30408 is an ENERGETIC TTL, not a session timeout: the command stops after
+  # this many minutes, but 30100/30407 stay armed, local battery logic stays
+  # suppressed and the house draws from the grid. Slots longer than this are
+  # covered by re-arming at command_renew_fraction of it. 1..10 on this
+  # firmware. Use 2 for supervised tests (a 1 min TTL puts the 50% renewal on
+  # the inverter's 30 s write cooldown).
+  command_ttl_minutes: 5
+  command_renew_fraction: 0.5
 
   # ==========================================================================
   # Battery Parameters
@@ -392,10 +420,11 @@ battery_optimizer:
   # Session safety: the durable lease and the heartbeat the reaper watches
   # ==========================================================================
   #
-  # This inverter has NO working watchdog: a session armed and left alone was
-  # still armed 50% past its window (2026-09-05), and only an explicit release
-  # ended it. So a process that dies holding one strands the inverter on its
-  # last command until something cleans up.
+  # No expiry ends a SESSION on this inverter. 30408 stops the energetic command
+  # on time (1 min -> 60 s, 2 min -> 122 s, measured), but a session armed and
+  # left alone was still armed 50% past its window (2026-09-05): authority
+  # stays held and the house moves onto the grid. So a process that dies holding
+  # one strands the inverter until something releases it.
   #
   # The lease is written BEFORE authority is taken and removed only once a
   # release is confirmed in both halves. It is what lets a later run recognise
@@ -405,14 +434,17 @@ battery_optimizer:
   # watches it go stale.
   heartbeat_path: /config/battery_optimizer/optimizer_heartbeat.json
   heartbeat_seconds: 30
+  # How old the PREVIOUS instance's heartbeat must be before startup recovery
+  # releases what it left armed. Keep it equal to the reaper's value below.
+  heartbeat_stale_seconds: 90
 
 # A SEPARATE app, because nothing inside the optimizer can be the answer to the
 # optimizer not running. It can release a stranded session and nothing else.
 #
 # Note the boundary: this is independent of the optimizer app, not of
-# AppDaemon. If the add-on itself dies, both die, and the inverter stays armed
-# until AppDaemon returns -- at which point the lease and startup recovery
-# clean it up.
+# AppDaemon. If the add-on itself dies, both die; the HA watchdog package
+# (homeassistant/packages/battery_optimizer_watchdog.yaml) restarts the add-on,
+# and startup recovery then releases what was left armed.
 session_reaper:
   module: session_reaper
   class: SessionReaper

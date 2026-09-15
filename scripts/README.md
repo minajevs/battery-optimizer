@@ -3,48 +3,66 @@
 `deploy.ps1` below came from the upstream repository this project was forked
 from. It is Windows PowerShell and it targets `\\192.168.33.167`, a host that
 does not exist on this network — Home Assistant runs at **192.168.1.130**.
-Keep it for reference; use `deploy.py` for this installation.
+**Everything below the `---` is that upstream script's documentation and does
+not apply here.** Use `deploy.py`.
 
 ## deploy.py (macOS, over a mounted Samba share)
 
-The instance exposes no SSH and no file API: only Home Assistant on 8123 and
-the Supervisor observer on 4357, and the available token is not an admin one
-(`/api/hassio/*` answers 401). So files go over the **Samba share** add-on, and
-**nothing is restarted automatically** — a script that cannot verify a restart
-happened has no business claiming it did.
+**The full runbook is `docs/deployment.md`** — ids, credentials, verification,
+monitoring and gotchas. This section is only the deploy mechanics.
 
-One-time, after installing and starting the Samba share add-on:
+Files go over the **Samba share** add-on. The long-lived token can read the
+Core and AppDaemon logs through the Supervisor proxy but cannot stop, start or
+restart add-ons (401), so **nothing is restarted automatically** — ask the user
+to do it in the UI. A script that cannot verify a restart happened has no
+business claiming it did.
 
-```bash
-mkdir -p /Volumes/ha-config /Volumes/ha-addons
-mount_smbfs //<user>@192.168.1.130/config        /Volumes/ha-config
-mount_smbfs //<user>@192.168.1.130/addon_configs /Volumes/ha-addons
-```
-
-Then:
+Mount (they drop after sleep; `mount | grep -c 192.168.1.130` should say 2):
 
 ```bash
-# the Growatt integration -> /config/custom_components/growatt_modbus
-uv run python scripts/deploy.py --target integration            # dry run
-uv run python scripts/deploy.py --target integration --confirm --prune
-# then: Settings > System > Restart Home Assistant
-#   (a config-entry reload re-uses the already-imported modules)
-
-# the optimizer and the session reaper -> the AppDaemon apps directory
-# STOP the AppDaemon add-on first: it hot-reloads on every .py change, so a
-# multi-file copy imports new modules against old ones.
-uv run python scripts/deploy.py --target appdaemon --confirm --prune \
-    --appdaemon-stopped
-# then: Settings > Add-ons > AppDaemon > Start
+mkdir -p ~/mnt/ha-config ~/mnt/ha-addons
+P=$(cat ~/.ha_samba_password)                  # Samba user: homeassistant
+mount_smbfs "//homeassistant:${P}@192.168.1.130/config"        ~/mnt/ha-config
+mount_smbfs "//homeassistant:${P}@192.168.1.130/addon_configs" ~/mnt/ha-addons
+unset P
 ```
+
+The script's defaults point at `/Volumes/ha-*`, which do not exist on this
+machine, so always pass the mounts:
+
+```bash
+M="--addons-mount $HOME/mnt/ha-addons --config-mount $HOME/mnt/ha-config"
+
+# the optimizer and the session reaper -> AppDaemon's apps directory
+uv run --no-project python scripts/deploy.py --target appdaemon --dry-run $M
+#   ask the user to STOP the AppDaemon add-on; wait until they confirm
+uv run --no-project python scripts/deploy.py --target appdaemon --confirm --appdaemon-stopped $M
+#   ask the user to START it, then verify (docs/deployment.md §6)
+```
+
+`--appdaemon-stopped` is an **assertion**: AppDaemon hot-reloads on every
+`.py` change, so a multi-file copy into a running instance imports new modules
+against old ones. Pass it only once the add-on really is stopped.
+
+**Do not use `--prune` with `--target appdaemon`.** It walks the whole apps
+directory and deletes every `.py` the repo does not have — including other
+apps, the default `hello.py`, and any probe app you dropped in to diagnose
+something.
+
+**Do not deploy `--target integration`.** The live `growatt_modbus` is managed
+by HACS (2.0.3 as of 2026-09-15) and already contains this project's merged
+fixes; deploying `../Growatt_ModbusTCP` would push whatever that checkout holds
+(an unreleased `v2.0.4-b5` at the time of writing) over it, and HACS would
+later overwrite it anyway. The target is kept for the day a fix has to be
+tested before it is released.
 
 Every run: preflight (tests in the repo that owns the target, byte-compile with
 an interpreter at least as new as HA's 3.13), timestamped backup into
 `deploy-backups/` beside the tree (never inside it — a backup under
 `custom_components/` would itself be scanned as an integration), copy only what
-differs, `--prune` what the source no longer has, delete `__pycache__`, then
-verify every file by SHA256. `apps.yaml` is never deployed: the live one holds
-the HA token and this installation's tuning.
+differs, delete `__pycache__`, then verify every file by SHA256. `apps.yaml` is
+never deployed: the live one holds the HA token and this installation's
+settings.
 
 ---
 
